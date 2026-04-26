@@ -16,7 +16,7 @@ groups_list = []
 current_group = None
 last_update_id = 0
 user_states = {}
-leave_temp = {}
+leave_selected_group = {}
 
 print("="*60)
 print("🤖 VC BOT - SMART LEAVE SYSTEM")
@@ -111,21 +111,6 @@ def show_leave_groups(chat_id):
     keyboard["inline_keyboard"].append([{"text": "❌ Cancel", "callback_data": "cancel_leave"}])
     send_message(chat_id, "Select group to leave:", keyboard)
 
-def show_leave_count(chat_id, group_id, group_name, total_count):
-    keyboard = {"inline_keyboard": []}
-    counts = [1, 2, 3, 4, 5, 10, total_count]
-    row = []
-    for c in counts:
-        if c <= total_count:
-            row.append({"text": str(c), "callback_data": f"leave_count_{group_id}_{c}"})
-        if len(row) == 3:
-            keyboard["inline_keyboard"].append(row)
-            row = []
-    if row:
-        keyboard["inline_keyboard"].append(row)
-    keyboard["inline_keyboard"].append([{"text": "🔙 Back", "callback_data": "back_to_groups"}])
-    send_message(chat_id, f"Group: {group_name}\nActive: {total_count}\nHow many to leave?", keyboard)
-
 while True:
     try:
         response = requests.get(f"{API_URL}/getUpdates", params={"offset": last_update_id + 1, "timeout": 30}, timeout=35)
@@ -146,16 +131,16 @@ while True:
                 print(f"\n📞 Callback: {data_cb}")
                 if data_cb == "connect":
                     user_states[user_id] = {"step": "awaiting_session"}
-                    send_message(chat_id, "Send Pyrogram String Session\nType /done when finished")
+                    send_message(chat_id, "📱 Send Pyrogram String Session\nType /done when finished")
                 elif data_cb == "status":
-                    status_text = f"**Status**\nSessions: {len(user_sessions)}\nActive VC: {len(active_vc)}\nGroups: {len(groups_list)}"
+                    status_text = f"**📊 Status**\nSessions: {len(user_sessions)}\nActive VC: {len(active_vc)}\nGroups: {len(groups_list)}"
                     send_message(chat_id, status_text)
                 elif data_cb == "public_group":
                     user_states[user_id] = {"step": "public_username"}
-                    send_message(chat_id, "Send group @username")
+                    send_message(chat_id, "📝 Send group @username")
                 elif data_cb == "private_group":
                     user_states[user_id] = {"step": "private_link"}
-                    send_message(chat_id, "Send invite link")
+                    send_message(chat_id, "🔗 Send invite link")
                 elif data_cb == "show_groups":
                     if not groups_list:
                         send_message(chat_id, "No groups added! Use /add")
@@ -170,7 +155,7 @@ while True:
                     idx = int(data_cb.split("_")[2])
                     if idx < len(groups_list):
                         current_group = groups_list[idx]
-                        send_message(chat_id, f"Switched to: {current_group['name']}")
+                        send_message(chat_id, f"✅ Switched to: {current_group['name']}")
                 elif data_cb == "leave_vc":
                     show_leave_groups(chat_id)
                 elif data_cb.startswith("leave_group_"):
@@ -182,35 +167,41 @@ while True:
                             gname = d["group_name"]
                             tcount += 1
                     if gname:
-                        leave_temp[user_id] = {"group_id": gid, "group_name": gname}
-                        show_leave_count(chat_id, gid, gname, tcount)
-                elif data_cb.startswith("leave_count_"):
-                    parts = data_cb.split("_")
-                    gid = int(parts[2])
-                    count = int(parts[3])
-                    send_message(chat_id, f"Leaving {count} accounts...")
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    results = loop.run_until_complete(leave_specific_accounts(gid, count))
-                    loop.close()
-                    scount = sum(1 for r in results if r["success"])
-                    send_message(chat_id, f"Left {scount} accounts")
-                    if user_id in leave_temp:
-                        del leave_temp[user_id]
-                elif data_cb == "back_to_groups":
-                    show_leave_groups(chat_id)
+                        leave_selected_group[user_id] = {"group_id": gid, "group_name": gname, "total": tcount}
+                        send_message(chat_id, f"🎤 Group: {gname}\n👥 Active accounts: {tcount}\n\n📝 **Send number of accounts to leave** (1 to {tcount})")
                 elif data_cb == "cancel_leave":
-                    send_message(chat_id, "Cancelled")
-                    if user_id in leave_temp:
-                        del leave_temp[user_id]
+                    send_message(chat_id, "❌ Cancelled")
+                    if user_id in leave_selected_group:
+                        del leave_selected_group[user_id]
                 requests.post(f"{API_URL}/answerCallbackQuery", json={"callback_query_id": callback["id"]})
             elif "message" in update:
                 msg = update["message"]
                 user_id = msg["from"]["id"]
                 chat_id = msg["chat"]["id"]
                 text = msg.get("text", "")
-                print(f"\n📨 {text}")
+                print(f"\n📨 Message: {text}")
                 if user_id != OWNER_ID:
+                    continue
+                # Handle leave count input
+                if user_id in leave_selected_group:
+                    try:
+                        count = int(text)
+                        group_info = leave_selected_group[user_id]
+                        if count <= 0:
+                            send_message(chat_id, "❌ Count must be greater than 0!")
+                        elif count > group_info["total"]:
+                            send_message(chat_id, f"❌ Only {group_info['total']} accounts active! Send smaller number.")
+                        else:
+                            send_message(chat_id, f"🚪 Leaving {count} accounts from {group_info['group_name']}...")
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                            results = loop.run_until_complete(leave_specific_accounts(group_info["group_id"], count))
+                            loop.close()
+                            scount = sum(1 for r in results if r["success"])
+                            send_message(chat_id, f"✅ Left {scount} accounts from {group_info['group_name']}")
+                            del leave_selected_group[user_id]
+                    except ValueError:
+                        send_message(chat_id, "❌ Please send a valid number!")
                     continue
                 if text == "/start":
                     kb = {"inline_keyboard": [
@@ -220,7 +211,7 @@ while True:
                         [{"text": "📋 Groups", "callback_data": "show_groups"}],
                         [{"text": "🚪 Leave VC", "callback_data": "leave_vc"}]
                     ]}
-                    send_message(chat_id, "**VC Manager Bot**\n\n/add - Add group\n/joinvc <count> - Join VC\n/leavevc - Smart leave\n/groups - All groups\n/status - Status\n/done - Done", kb)
+                    send_message(chat_id, "**🎵 VC Manager Bot**\n\n/add - Add group\n/joinvc <count> - Join VC\n/leavevc - Smart leave\n/groups - All groups\n/status - Status\n/done - Done", kb)
                 elif text == "/add":
                     kb = {"inline_keyboard": [
                         [{"text": "🌐 Public", "callback_data": "public_group"}],
@@ -256,13 +247,13 @@ while True:
                     if count > len(user_sessions):
                         send_message(chat_id, f"Only {len(user_sessions)} sessions available")
                         continue
-                    send_message(chat_id, f"Joining {count} accounts to {current_group['name']}...")
+                    send_message(chat_id, f"🎤 Joining {count} accounts to {current_group['name']}...")
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
                     results = loop.run_until_complete(join_voice_chat(current_group["chat_id"], current_group["name"], count))
                     loop.close()
                     scount = sum(1 for r in results if r["success"])
-                    msg_text = f"Joined: {scount}/{count}\n"
+                    msg_text = f"✅ Joined: {scount}/{count}\n"
                     for r in results:
                         if r["success"]:
                             msg_text += f"✅ {r['name']}\n"
@@ -270,17 +261,17 @@ while True:
                             msg_text += f"❌ {r['name']}: {r['error']}\n"
                     send_message(chat_id, msg_text)
                 elif text == "/status":
-                    status_text = f"**Status**\nSessions: {len(user_sessions)}\nActive VC: {len(active_vc)}\nGroups: {len(groups_list)}"
+                    status_text = f"**📊 Status**\nSessions: {len(user_sessions)}\nActive VC: {len(active_vc)}\nGroups: {len(groups_list)}"
                     if current_group:
                         status_text += f"\nCurrent: {current_group['name']}"
                     send_message(chat_id, status_text)
                 elif text == "/done":
-                    send_message(chat_id, f"Done! Total sessions: {len(user_sessions)}")
+                    send_message(chat_id, f"✅ Done! Total sessions: {len(user_sessions)}")
                     if user_id in user_states:
                         del user_states[user_id]
                 elif user_id in user_states and user_states[user_id].get("step") == "awaiting_session":
                     if len(text) > 50:
-                        send_message(chat_id, "Testing session...")
+                        send_message(chat_id, "⏳ Testing session...")
                         loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(loop)
                         result = loop.run_until_complete(test_session(text))
