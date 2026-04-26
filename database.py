@@ -1,5 +1,4 @@
 import sqlite3
-import pickle
 
 class Database:
     def __init__(self):
@@ -8,7 +7,6 @@ class Database:
     
     def create_tables(self):
         cursor = self.conn.cursor()
-        # Sessions table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -20,7 +18,6 @@ class Database:
             )
         ''')
         
-        # Groups table (stored groups for VC)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS groups (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -35,7 +32,6 @@ class Database:
             )
         ''')
         
-        # Sudo users
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS sudo_users (
                 user_id INTEGER PRIMARY KEY,
