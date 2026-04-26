@@ -1,368 +1,326 @@
-# main.py - FINAL WORKING VERSION
-from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
+cat > main.py << 'EOF'
+import requests
+import time
+import json
 import asyncio
-import logging
-import traceback
-from pytgcalls import PyTgCalls
-from pytgcalls.types import MediaStream
+from pyrogram import Client
+from pytgcalls import GroupCallFactory
 from config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID
-from database import db
-import os
-import signal
-import sys
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+TOKEN = BOT_TOKEN
+API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
-# Bot client
-bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-# Store user sessions and voice calls
+user_sessions = []
 user_clients = {}
 voice_calls = {}
+current_group = None
+last_update_id = 0
 user_states = {}
-active_vc_groups = {}
 
-print("\n" + "="*50)
-print("🤖 BOT IS STARTING...")
-print("="*50)
+print("="*60)
+print("🤖 VC BOT - FULLY WORKING")
+print("="*60)
+print("Bot started! Send /start on Telegram\n")
 
-# SUDO FILTER
-def sudo_only(func):
-    async def wrapper(client, message):
-        user_id = message.from_user.id
-        if user_id == OWNER_ID or db.is_sudo(user_id):
-            return await func(client, message)
-        else:
-            await message.reply("❌ You are not authorized!")
-    return wrapper
-
-@bot.on_message(filters.command("start"))
-async def start_command(client, message):
+def send_message(chat_id, text, reply_markup=None):
+    data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup)
     try:
-        print(f"✅ Start command from {message.from_user.id}")
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔌 Connect Session", callback_data="connect")],
-            [InlineKeyboardButton("📊 Status", callback_data="status")],
-            [InlineKeyboardButton("ℹ️ Help", callback_data="help")]
-        ])
-        await message.reply(
-            "**🎵 VC Manager Bot**\n\n"
-            "🔹 Click 'Connect Session' to add pyrogram sessions\n"
-            "🔹 Use /add to add a group\n"
-            "🔹 Use /joinvc <count> to join voice chat\n\n"
-            f"**Total sessions:** {db.get_session_count()}",
-            reply_markup=keyboard
-        )
+        requests.post(f"{API_URL}/sendMessage", json=data, timeout=5)
+    except:
+        pass
+
+async def test_session(session_string):
+    try:
+        client = Client("test_temp", api_id=API_ID, api_hash=API_HASH, session_string=session_string)
+        await client.start()
+        me = await client.get_me()
+        await client.stop()
+        return {"success": True, "name": me.first_name, "id": me.id, "username": me.username}
     except Exception as e:
-        print(f"Error: {e}")
-        await message.reply(f"Error: {e}")
+        return {"success": False, "error": str(e)}
 
-@bot.on_callback_query()
-async def handle_callbacks(client, callback_query: CallbackQuery):
-    try:
-        data = callback_query.data
-        user_id = callback_query.from_user.id
-        print(f"Callback: {data} from {user_id}")
+async def join_voice_chat(chat_id, group_name, count):
+    results = []
+    for i, session_data in enumerate(user_sessions[:count]):
+        session_string = session_data["string"]
+        acc_name = session_data["name"]
+        acc_id = session_data["id"]
         
-        if data == "connect":
-            user_states[user_id] = {"step": "awaiting_session"}
-            await callback_query.message.reply(
-                "📱 **Send Pyrogram String Session**\n\n"
-                "Get from @StringSessionBot\n"
-                "Type /done when finished"
-            )
-        
-        elif data == "status":
-            total = db.get_session_count()
-            sessions = db.get_all_sessions()
-            status_text = f"**📊 Status**\n\nTotal: {total}\nActive: {len(user_clients)}\n\n"
-            if sessions:
-                for idx, s in enumerate(sessions, 1):
-                    status_text += f"{idx}. {s[3]}\n"
-            await callback_query.message.reply(status_text)
-        
-        elif data == "help":
-            help_text = """
-**Commands:**
-/start - Start bot
-/add - Add group
-/joinvc <count> - Join VC
-/leavevc - Leave VC
-/play - Play audio (reply to audio)
-/stop - Stop audio
-/status - Check status
-/done - Finish adding sessions
-"""
-            await callback_query.message.reply(help_text)
-        
-        elif data == "public_group":
-            user_states[user_id] = {"step": "public_username"}
-            await callback_query.message.reply("Send group @username")
-        
-        elif data == "private_group":
-            user_states[user_id] = {"step": "private_link"}
-            await callback_query.message.reply("Send invite link")
+        try:
+            if acc_name not in user_clients:
+                print(f"  Creating client for {acc_name}...")
+                client = Client(f"sessions/{acc_name}", api_id=API_ID, api_hash=API_HASH, session_string=session_string)
+                await client.start()
+                user_clients[acc_name] = client
             
-    except Exception as e:
-        print(f"Callback error: {e}")
-        await callback_query.message.reply(f"Error: {e}")
-
-@bot.on_message(filters.command("done") & filters.private)
-async def done_command(client, message):
-    total = db.get_session_count()
-    await message.reply(f"✅ Done! Total sessions: {total}")
-    if message.from_user.id in user_states:
-        del user_states[message.from_user.id]
-
-@bot.on_message(filters.command("add") & filters.private)
-@sudo_only
-async def add_group_command(client, message):
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌐 Public", callback_data="public_group")],
-        [InlineKeyboardButton("🔒 Private", callback_data="private_group")]
-    ])
-    await message.reply("Select group type:", reply_markup=keyboard)
-
-@bot.on_message(filters.command("joinvc") & filters.private)
-@sudo_only
-async def join_vc_command(client, message):
-    try:
-        args = message.text.split()
-        if len(args) != 2:
-            await message.reply("Usage: /joinvc <count>")
-            return
-        
-        count = int(args[1])
-        group = db.get_active_group()
-        
-        if not group:
-            await message.reply("No group added! Use /add")
-            return
-        
-        # Get chat_id
-        if group[3] == "public":
-            username = group[4]
-            chat = await client.get_chat(username)
-            chat_id = chat.id
-        else:
-            chat_id = group[6]
-        
-        group_name = group[2]
-        sessions = db.get_all_sessions()
-        
-        if count > len(sessions):
-            await message.reply(f"Only {len(sessions)} sessions available")
-            return
-        
-        await message.reply(f"Joining {count} accounts to {group_name}...")
-        
-        joined = 0
-        for idx, session_data in enumerate(sessions[:count], 1):
-            session_string = session_data[1]
-            user_name = session_data[3]
+            client = user_clients[acc_name]
+            factory = GroupCallFactory(client)
+            vc = factory.get_file_group_call()
             
             try:
-                if user_name not in user_clients:
-                    client_obj = Client(f"sessions/{user_name}", 
-                                       api_id=API_ID, 
-                                       api_hash=API_HASH, 
-                                       session_string=session_string)
-                    await client_obj.start()
-                    user_clients[user_name] = client_obj
-                    
-                    vc = PyTgCalls(client_obj)
-                    await vc.start()
-                    voice_calls[user_name] = vc
-                
-                await voice_calls[user_name].join_group_call(chat_id)
-                joined += 1
-                await message.reply(f"✅ {idx}. {user_name} joined")
-                
+                await vc.start(chat_id)
+                voice_calls[acc_name] = vc
+                results.append({"success": True, "name": acc_name, "id": acc_id})
+                print(f"  ✅ {acc_name} joined")
             except Exception as e:
-                await message.reply(f"❌ {user_name}: {str(e)[:30]}")
+                error_msg = str(e)
+                if "not active" in error_msg.lower():
+                    results.append({"success": False, "name": acc_name, "id": acc_id, "error": "Voice chat not active! Start VC first."})
+                else:
+                    results.append({"success": False, "name": acc_name, "id": acc_id, "error": error_msg[:50]})
+                print(f"  ❌ {acc_name} failed: {error_msg[:50]}")
             
-            await asyncio.sleep(1)
+        except Exception as e:
+            results.append({"success": False, "name": acc_name, "id": acc_id, "error": str(e)[:50]})
+            print(f"  ❌ {acc_name} error: {e}")
         
-        await message.reply(f"✅ Joined: {joined}/{count}")
-        
-    except Exception as e:
-        print(f"JoinVC error: {e}")
-        await message.reply(f"Error: {e}")
+        await asyncio.sleep(2)
+    return results
 
-@bot.on_message(filters.command("leavevc") & filters.private)
-@sudo_only
-async def leave_vc_command(client, message):
-    left = 0
+async def leave_voice_chat():
     for name, vc in voice_calls.items():
         try:
-            await vc.leave_group_call()
-            left += 1
+            await vc.stop()
         except:
             pass
     voice_calls.clear()
-    await message.reply(f"✅ {left} accounts left")
+    return True
 
-@bot.on_message(filters.command("play") & filters.private)
-@sudo_only
-async def play_audio_command(client, message):
-    if not message.reply_to_message or not message.reply_to_message.audio:
-        await message.reply("Reply to an audio with /play")
-        return
-    
-    if not voice_calls:
-        await message.reply("No active VC! Use /joinvc first")
-        return
-    
-    msg = await message.reply("Downloading audio...")
-    audio_path = await message.reply_to_message.download("audio/")
-    
-    await msg.edit_text("Playing audio...")
-    played = 0
-    
-    for name, vc in voice_calls.items():
-        try:
-            await vc.change_stream(MediaStream(audio_path))
-            played += 1
-        except Exception as e:
-            await message.reply(f"Failed on {name}: {str(e)[:30]}")
-    
-    await msg.edit_text(f"✅ Playing in {played}/{len(voice_calls)} VCs")
-
-@bot.on_message(filters.command("stop") & filters.private)
-@sudo_only
-async def stop_audio_command(client, message):
-    stopped = 0
-    for name, vc in voice_calls.items():
-        try:
-            await vc.stop_stream()
-            stopped += 1
-        except:
-            pass
-    await message.reply(f"⏹️ Stopped in {stopped} VCs")
-
-@bot.on_message(filters.command("status") & filters.private)
-@sudo_only
-async def status_command(client, message):
-    status_text = f"""
-**Bot Status**
-📱 Sessions: {db.get_session_count()}
-🟢 Active: {len(user_clients)}
-🎤 In VC: {len(voice_calls)}
-"""
-    await message.reply(status_text)
-
-@bot.on_message(filters.command("addsudo") & filters.private)
-async def add_sudo_command(client, message):
-    if message.from_user.id != OWNER_ID:
-        await message.reply("Only owner can use this")
-        return
-    
-    args = message.text.split()
-    if len(args) != 2:
-        await message.reply("Usage: /addsudo <user_id>")
-        return
-    
-    db.add_sudo(int(args[1]), OWNER_ID)
-    await message.reply(f"✅ Sudo user added")
-
-@bot.on_message(filters.command("rmsudo") & filters.private)
-async def remove_sudo_command(client, message):
-    if message.from_user.id != OWNER_ID:
-        await message.reply("Only owner can use this")
-        return
-    
-    args = message.text.split()
-    if len(args) != 2:
-        await message.reply("Usage: /rmsudo <user_id>")
-        return
-    
-    db.remove_sudo(int(args[1]))
-    await message.reply(f"✅ Sudo user removed")
-
-@bot.on_message(filters.private & filters.text)
-async def handle_messages(client, message):
-    user_id = message.from_user.id
-    text = message.text
-    
-    if text.startswith('/'):
-        return
-    
-    # Handle session input
-    if user_id in user_states and user_states[user_id].get("step") == "awaiting_session":
-        if len(text) > 50:
-            try:
-                test_client = Client(f"temp_{user_id}", 
-                                   api_id=API_ID, 
-                                   api_hash=API_HASH, 
-                                   session_string=text)
-                await test_client.start()
-                me = await test_client.get_me()
-                await test_client.stop()
-                
-                db.add_session(text, me.id, me.first_name, me.username or "")
-                await message.reply(f"✅ Added: {me.first_name}\nTotal: {db.get_session_count()}")
-                
-            except Exception as e:
-                await message.reply(f"❌ Invalid session: {e}")
-    
-    # Handle public username
-    elif user_id in user_states and user_states[user_id].get("step") == "public_username":
-        username = text.replace('@', '')
-        try:
-            group = await client.get_chat(username)
-            db.add_group(group.id, group.title, "public", username, None, group.id, user_id)
-            await message.reply(f"✅ Added: {group.title}\nUse /joinvc <count>")
-            del user_states[user_id]
-        except Exception as e:
-            await message.reply(f"❌ Error: {e}")
-    
-    # Handle private link
-    elif user_id in user_states and user_states[user_id].get("step") == "private_link":
-        user_states[user_id] = {"step": "private_chatid", "link": text}
-        await message.reply("Send chat_id (example: -1001234567890)")
-    
-    # Handle private chat_id
-    elif user_id in user_states and user_states[user_id].get("step") == "private_chatid":
-        try:
-            chat_id = int(text)
-            invite_link = user_states[user_id]["link"]
-            group = await client.get_chat(chat_id)
-            db.add_group(group.id, group.title, "private", None, invite_link, chat_id, user_id)
-            await message.reply(f"✅ Added: {group.title}\nUse /joinvc <count>")
-            del user_states[user_id]
-        except Exception as e:
-            await message.reply(f"❌ Error: {e}")
-
-def signal_handler(sig, frame):
-    print("\n\n⚠️ Stopping bot...")
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, signal_handler)
-
-async def main():
-    os.makedirs("sessions", exist_ok=True)
-    os.makedirs("audio", exist_ok=True)
-    
-    print("🚀 Starting bot...")
-    await bot.start()
-    
-    me = await bot.get_me()
-    print(f"✅ Bot running as @{me.username}")
-    print(f"📊 Sessions in DB: {db.get_session_count()}")
-    print("\n Waiting for commands...\n")
-    
-    # Keep bot running
-    while True:
-        await asyncio.sleep(1)
-
-if __name__ == "__main__":
+while True:
     try:
-        asyncio.run(main())
+        response = requests.get(f"{API_URL}/getUpdates", params={"offset": last_update_id + 1, "timeout": 30}, timeout=35)
+        
+        if response.status_code != 200:
+            time.sleep(5)
+            continue
+        
+        data = response.json()
+        if not data.get("ok"):
+            time.sleep(5)
+            continue
+        
+        for update in data.get("result", []):
+            last_update_id = update["update_id"]
+            
+            if "callback_query" in update:
+                callback = update["callback_query"]
+                user_id = callback["from"]["id"]
+                chat_id = callback["message"]["chat"]["id"]
+                data_cb = callback["data"]
+                
+                print(f"\n📞 Callback: {data_cb}")
+                
+                if data_cb == "connect":
+                    user_states[user_id] = {"step": "awaiting_session"}
+                    send_message(chat_id, "📱 **Send Pyrogram String Session**\n\nGet from @StringSessionBot\nType `/done` when finished")
+                
+                elif data_cb == "status":
+                    status_text = f"**📊 Bot Status**\n\n"
+                    status_text += f"📱 Sessions: `{len(user_sessions)}`\n"
+                    status_text += f"🎤 Active VCs: `{len(voice_calls)}`\n"
+                    if current_group:
+                        status_text += f"📍 Group: `{current_group[2]}`\n"
+                        status_text += f"🆔 Chat ID: `{current_group[1]}`\n"
+                    status_text += f"\n**Sessions List:**\n"
+                    for i, s in enumerate(user_sessions, 1):
+                        status_text += f"{i}. `{s['name']}` (ID: `{s['id']}`)\n"
+                    send_message(chat_id, status_text)
+                
+                elif data_cb == "public_group":
+                    user_states[user_id] = {"step": "public_username"}
+                    send_message(chat_id, "📝 **Send group @username**\nExample: `@mygroup`\n\n⚠️ Voice chat must be active in group!")
+                
+                elif data_cb == "private_group":
+                    user_states[user_id] = {"step": "private_link"}
+                    send_message(chat_id, "🔗 **Send group invite link**")
+                
+                requests.post(f"{API_URL}/answerCallbackQuery", json={"callback_query_id": callback["id"]})
+            
+            elif "message" in update:
+                msg = update["message"]
+                user_id = msg["from"]["id"]
+                chat_id = msg["chat"]["id"]
+                text = msg.get("text", "")
+                
+                print(f"\n📨 Message: {text}")
+                
+                if user_id != OWNER_ID:
+                    continue
+                
+                if text == "/start":
+                    keyboard = {
+                        "inline_keyboard": [
+                            [{"text": "🔌 Connect Session", "callback_data": "connect"}],
+                            [{"text": "📊 Status", "callback_data": "status"}],
+                            [{"text": "➕ Add Group", "callback_data": "public_group"}]
+                        ]
+                    }
+                    send_message(chat_id, "**🎵 VC Manager Bot**\n\nManage multiple accounts in voice chats!\n\n⚠️ Voice chat must be started by someone in the group first!", keyboard)
+                
+                elif text == "/add":
+                    keyboard = {
+                        "inline_keyboard": [
+                            [{"text": "🌐 Public Group", "callback_data": "public_group"}],
+                            [{"text": "🔒 Private Group", "callback_data": "private_group"}]
+                        ]
+                    }
+                    send_message(chat_id, "**Select group type:**", keyboard)
+                
+                elif text.startswith("/joinvc"):
+                    parts = text.split()
+                    if len(parts) != 2:
+                        send_message(chat_id, "❌ **Usage:** `/joinvc <count>`\nExample: `/joinvc 5`")
+                        continue
+                    
+                    try:
+                        count = int(parts[1])
+                    except:
+                        send_message(chat_id, "❌ Count must be a number!")
+                        continue
+                    
+                    if not current_group:
+                        send_message(chat_id, "❌ **No group added!** Use `/add` first")
+                        continue
+                    
+                    if len(user_sessions) == 0:
+                        send_message(chat_id, "❌ **No sessions added!**")
+                        continue
+                    
+                    if count > len(user_sessions):
+                        send_message(chat_id, f"❌ Only `{len(user_sessions)}` sessions available")
+                        continue
+                    
+                    group_name = current_group[2]
+                    group_chat_id = current_group[1]
+                    
+                    send_message(chat_id, f"🎤 **Joining {count} accounts to {group_name}...**\n⏳ Please wait...")
+                    print(f"  🎤 Joining {count} accounts to {group_name}")
+                    
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    results = loop.run_until_complete(join_voice_chat(group_chat_id, group_name, count))
+                    loop.close()
+                    
+                    success_count = sum(1 for r in results if r["success"])
+                    
+                    result_text = f"**🎉 Voice Chat Join Result**\n\n"
+                    result_text += f"📍 **Group:** `{group_name}`\n"
+                    result_text += f"✅ **Joined:** `{success_count}/{count}`\n\n"
+                    result_text += f"**📋 Details:**\n"
+                    
+                    for r in results:
+                        if r["success"]:
+                            result_text += f"✅ `{r['name']}` (ID: `{r['id']}`)\n"
+                        else:
+                            result_text += f"❌ `{r['name']}`: `{r['error']}`\n"
+                    
+                    if success_count == 0:
+                        result_text += f"\n⚠️ **Troubleshooting:**\n"
+                        result_text += f"1. Someone must start voice chat in {group_name} first\n"
+                        result_text += f"2. Click the 📞 phone icon in the group\n"
+                        result_text += f"3. Then try `/joinvc {count}` again"
+                    
+                    send_message(chat_id, result_text)
+                    print(f"  ✅ Join completed: {success_count} joined")
+                
+                elif text == "/leavevc":
+                    if len(voice_calls) == 0:
+                        send_message(chat_id, "❌ **No active voice chats!**")
+                        continue
+                    
+                    send_message(chat_id, "🚪 **Leaving voice chats...**")
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(leave_voice_chat())
+                    loop.close()
+                    send_message(chat_id, f"✅ **Left voice chat**")
+                
+                elif text == "/status":
+                    status_text = f"**📊 Bot Status**\n\n"
+                    status_text += f"📱 **Sessions:** `{len(user_sessions)}`\n"
+                    status_text += f"🎤 **Active VCs:** `{len(voice_calls)}`\n"
+                    if current_group:
+                        status_text += f"📍 **Group:** `{current_group[2]}`\n"
+                        status_text += f"🆔 **Chat ID:** `{current_group[1]}`\n"
+                    status_text += f"\n**📋 Sessions:**\n"
+                    for i, s in enumerate(user_sessions, 1):
+                        status_text += f"{i}. `{s['name']}` (ID: `{s['id']}`)\n"
+                    send_message(chat_id, status_text)
+                
+                elif text == "/done":
+                    send_message(chat_id, f"✅ **Done!**\n\nTotal sessions saved: `{len(user_sessions)}`")
+                    if user_id in user_states:
+                        del user_states[user_id]
+                
+                elif user_id in user_states and user_states[user_id].get("step") == "awaiting_session":
+                    if len(text) > 50:
+                        send_message(chat_id, "⏳ **Testing session...**")
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        result = loop.run_until_complete(test_session(text))
+                        loop.close()
+                        
+                        if result["success"]:
+                            user_sessions.append({
+                                "string": text,
+                                "name": result["name"],
+                                "id": result["id"],
+                                "username": result["username"]
+                            })
+                            send_message(chat_id, f"✅ **Session Added!**\n👤 `{result['name']}`\n🆔 `{result['id']}`\n📊 Total: `{len(user_sessions)}`")
+                        else:
+                            send_message(chat_id, f"❌ **Invalid Session!**\n`{result['error']}`")
+                
+                elif user_id in user_states and user_states[user_id].get("step") == "public_username":
+                    username = text.replace("@", "")
+                    send_message(chat_id, f"⏳ **Resolving @{username}...**")
+                    
+                    try:
+                        resp = requests.get(f"{API_URL}/getChat", params={"chat_id": f"@{username}"}, timeout=10)
+                        if resp.ok:
+                            chat_info = resp.json()["result"]
+                            group_title = chat_info.get("title", username)
+                            group_chat_id = chat_info["id"]
+                            current_group = (f"@{username}", group_chat_id, group_title)
+                            send_message(chat_id, f"✅ **Group Added!**\n📌 `{group_title}`\n🆔 `{group_chat_id}`\n\n⚠️ Start voice chat in group first, then use `/joinvc`")
+                        else:
+                            send_message(chat_id, f"❌ Could not resolve @{username}\nMake sure bot is in the group")
+                    except Exception as e:
+                        send_message(chat_id, f"❌ Error: `{e}`")
+                    del user_states[user_id]
+                
+                elif user_id in user_states and user_states[user_id].get("step") == "private_link":
+                    user_states[user_id] = {"step": "private_chatid", "link": text}
+                    send_message(chat_id, "📝 **Send Chat ID**\nExample: `-1001234567890`")
+                
+                elif user_id in user_states and user_states[user_id].get("step") == "private_chatid":
+                    try:
+                        chat_id_val = int(text)
+                        current_group = (user_states[user_id]["link"], chat_id_val, f"Private_{chat_id_val}")
+                        send_message(chat_id, f"✅ **Private Group Added!**\n🆔 `{chat_id_val}`")
+                        del user_states[user_id]
+                    except:
+                        send_message(chat_id, "❌ **Invalid Chat ID!**")
+        
+        time.sleep(1)
+        
     except KeyboardInterrupt:
-        print("\n Bot stopped")
+        print("\n\n⚠️ Bot stopped")
+        break
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        time.sleep(5)
+
+print("Bot stopped")
+EOF
+
+echo ""
+echo "=========================================="
+echo "✅ FINAL main.py created successfully!"
+echo "=========================================="
+echo ""
+echo "Run the bot with:"
+echo "python3 main.py"
+echo ""
