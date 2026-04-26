@@ -1,5 +1,4 @@
 pyrogram==2.0.106
 py-tgcalls==2.2.8
 tgcrypto==1.2.5
-sqlite3
 asyncio
