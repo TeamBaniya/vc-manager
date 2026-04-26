@@ -1,14 +1,12 @@
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
 from pyrogram.errors import SessionRevoked, AuthKeyInvalid
-from pyrogram.raw.functions.messages import GetFullChat
 import asyncio
 from pytgcalls import PyTgCalls
-from pytgcalls.types import AudioPiped
+from pytgcalls.types import MediaStream
 from config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID
 from database import db
 import os
-import re
 
 # Bot client
 bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -130,7 +128,7 @@ async def handle_messages(client, message):
     
     # Handle session string input
     if user_id in user_states and user_states[user_id].get("step") == "awaiting_session":
-        if text.startswith("K") and len(text) > 100:  # Pyrogram session string check
+        if len(text) > 100:  # Pyrogram session string check
             try:
                 # Try to create client with session
                 test_client = Client(f"sessions/user_{user_id}_{len(user_clients)}", 
@@ -185,7 +183,6 @@ async def handle_messages(client, message):
     # Handle private group invite link
     if user_id in user_states and user_states[user_id].get("step") == "private_link":
         invite_link = text.strip()
-        # Extract chat_id from invite link (https://t.me/+... or https://t.me/joinchat/...)
         await message.reply("📝 Now send the **Chat ID** of the group\n\nGet chat ID from @chatIDBot or any id bot\n\nExample: -1001234567890")
         user_states[user_id] = {"step": "private_chatid", "type": "private", "link": invite_link}
         return
@@ -243,7 +240,20 @@ async def join_vc_command(client, message):
         await message.reply("❌ No group added! Use /add first.")
         return
     
-    group_id = group[4] if group[3] == "public" else group[6]  # username or chat_id
+    # Get chat_id correctly
+    if group[3] == "public":
+        # Public group - resolve username to chat_id
+        username = group[4]
+        try:
+            chat = await client.get_chat(username)
+            chat_id = chat.id
+        except:
+            await message.reply("❌ Failed to resolve group! Make sure username is correct.")
+            return
+    else:
+        # Private group - use stored chat_id
+        chat_id = group[6]
+    
     group_name = group[2]
     
     # Get all sessions
@@ -285,10 +295,9 @@ async def join_vc_command(client, message):
             
             # Join the voice chat
             vc_obj = voice_calls[user_name]
-            await vc_obj.join_group_call(group_id)
+            await vc_obj.join_group_call(chat_id)
             joined += 1
             
-            # Send status to group (optional)
             await message.reply(f"✅ {idx}. {user_name} joined VC")
             
         except Exception as e:
@@ -297,7 +306,7 @@ async def join_vc_command(client, message):
         
         await asyncio.sleep(2)  # Delay to avoid flood wait
     
-    active_vc_groups[message.from_user.id] = group_id
+    active_vc_groups[message.from_user.id] = chat_id
     
     final_msg = f"**🎉 Voice Chat Joined!**\n\n"
     final_msg += f"✅ Successfully joined: {joined}\n"
@@ -321,9 +330,6 @@ async def leave_vc_command(client, message):
             left += 1
         except:
             pass
-    
-    # Clean up
-    voice_calls.clear()
     
     await message.reply(f"✅ {left} accounts left the voice chat!")
 
@@ -351,7 +357,8 @@ async def play_audio_command(client, message):
     played = 0
     for name, vc in voice_calls.items():
         try:
-            await vc.change_stream(AudioPiped(audio_path))
+            # For py-tgcalls 2.2.8 - using MediaStream
+            await vc.change_stream(MediaStream(audio_path))
             played += 1
         except Exception as e:
             await message.reply(f"❌ Failed on {name}: {str(e)[:50]}")
