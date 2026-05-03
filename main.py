@@ -1,384 +1,420 @@
+import requests
+import time
+import json
 import asyncio
-from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from config import BOT_TOKEN, API_ID, API_HASH
-from account_manager import AccountManager
-from vc_manager import VCManager
-from database import Database
+import os
+from pyrogram import Client
+from pytgcalls import GroupCallFactory
+from config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID
 
-# Bot client
-bot = Client("bot_session", API_ID, API_HASH, bot_token=BOT_TOKEN)
+TOKEN = BOT_TOKEN
+API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
-# Global objects
-acc_mgr = AccountManager()
-db = Database()
-vc_mgr = None
-accounts_loaded = False
+# Data storage
+user_sessions = []
+user_clients = {}
+active_vc = {}
+groups_list = []
+current_group = None
+last_update_id = 0
+user_states = {}
+leave_selected_group = {}
 
-async def initialize_vc():
-    global vc_mgr, accounts_loaded
-    if vc_mgr is None:
-        clients = await acc_mgr.load_all_sessions()
-        if clients:
-            vc_mgr = VCManager(clients)
-            accounts_loaded = True
-            print(f"✅ {len(clients)} accounts loaded")
-        else:
-            print("❌ No accounts found! Use /add_account first")
-            accounts_loaded = False
+print("="*60)
+print("🤖 VC MANAGER BOT - FINAL")
+print("="*60)
+print("Bot started! Send /start on Telegram\n")
 
-@bot.on_message(filters.command("start"))
-async def start_command(client: Client, message: Message):
-    await message.reply_text(
-        "🎵 **VC Manager Bot**\n\n"
-        "**Commands:**\n"
-        "/add_account - Add new Telegram account\n"
-        "/add_group - Add group for VC management\n"
-        "/list_groups - Show all configured groups\n"
-        "/start_vc [group_id] - Start VC for a group\n"
-        "/stop_vc [group_id] - Stop VC for a group\n"
-        "/status - Check accounts status\n"
-        "/remove_group [group_id] - Remove group config\n\n"
-        "**First time setup:**\n"
-        "1. Add accounts using /add_account\n"
-        "2. Add groups using /add_group\n"
-        "3. Start VC using /start_vc"
-    )
+def send_message(chat_id, text, reply_markup=None):
+    data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup)
+    try:
+        requests.post(f"{API_URL}/sendMessage", json=data, timeout=5)
+    except:
+        pass
 
-@bot.on_message(filters.command("add_account"))
-async def add_account_command(client: Client, message: Message):
-    await message.reply_text("📱 **Send phone number with country code:**\nExample: `+91XXXXXXXXXX`")
-    
-    response = await bot.wait_for_message(
-        chat_id=message.chat.id,
-        user_id=message.from_user.id,
-        timeout=60
-    )
-    
-    if response and response.text:
-        phone = response.text.strip()
-        status_msg = await message.reply_text(f"🔄 Processing `{phone}`...\nCheck console for OTP prompt.")
-        
-        session_file = await acc_mgr.create_new_session(phone)
-        if session_file:
-            await status_msg.edit_text(f"✅ Account `{phone}` added successfully!\nUse `/reset` to reload accounts.")
-        else:
-            await status_msg.edit_text(f"❌ Failed to add `{phone}`. Check console logs.")
-    else:
-        await message.reply_text("⏰ Timeout or invalid input.")
+async def test_session(session_string):
+    try:
+        client = Client("test_temp", api_id=API_ID, api_hash=API_HASH, session_string=session_string)
+        await client.start()
+        me = await client.get_me()
+        await client.stop()
+        return {"success": True, "name": me.first_name, "id": me.id, "username": me.username}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
-@bot.on_message(filters.command("add_group"))
-async def add_group_command(client: Client, message: Message):
-    """Inline buttons ke saath group add karna"""
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🌍 Public Group", callback_data="group_type_public"),
-            InlineKeyboardButton("🔒 Private Group", callback_data="group_type_private")
-        ]
-    ])
-    
-    await message.reply_text(
-        "**Select group type:**\n\n"
-        "• **Public Group** - Group username se connect (e.g., @mygroup)\n"
-        "• **Private Group** - Invite link se connect",
-        reply_markup=keyboard
-    )
-
-@bot.on_callback_query()
-async def handle_callback(client: Client, callback_query: CallbackQuery):
-    data = callback_query.data
-    
-    if data.startswith("group_type_"):
-        group_type = data.replace("group_type_", "")
-        
-        # Store in temporary user data
-        if not hasattr(bot, "temp_data"):
-            bot.temp_data = {}
-        
-        bot.temp_data[callback_query.from_user.id] = {"group_type": group_type}
-        
-        if group_type == "public":
-            await callback_query.message.edit_text(
-                "📢 **Public Group Setup**\n\n"
-                "Send the **group username** (without @):\n"
-                "Example: `my_public_group`\n\n"
-                "Or send the invite link if it's a public channel."
-            )
-        else:
-            await callback_query.message.edit_text(
-                "🔒 **Private Group Setup**\n\n"
-                "Send the **invite link**:\n"
-                "Example: `https://t.me/+abc123xyz`\n\n"
-                "Bot accounts will join the group using this link."
-            )
-        
-        # Wait for user input
-        response = await bot.wait_for_message(
-            chat_id=callback_query.message.chat.id,
-            user_id=callback_query.from_user.id,
-            timeout=120
-        )
-        
-        if response and response.text:
-            identifier = response.text.strip()
-            group_id = f"group_{callback_query.from_user.id}_{int(asyncio.get_event_loop().time())}"
+async def join_voice_chat(chat_id, group_name, count):
+    results = []
+    for i, session_data in enumerate(user_sessions[:count]):
+        session_string = session_data["string"]
+        acc_name = session_data["name"]
+        acc_id = session_data["id"]
+        try:
+            if acc_name not in user_clients:
+                print(f"  🔌 Creating client for {acc_name}...")
+                client = Client(f"sessions/{acc_name}", api_id=API_ID, api_hash=API_HASH, session_string=session_string)
+                await client.start()
+                user_clients[acc_name] = client
+                print(f"  ✅ Client created for {acc_name}")
             
-            # Save to database
-            db.add_group(group_id, group_type, identifier)
+            client = user_clients[acc_name]
+            factory = GroupCallFactory(client)
+            vc = factory.get_file_group_call()
             
-            await response.reply_text(
-                f"✅ **Group added successfully!**\n\n"
-                f"**Group ID:** `{group_id}`\n"
-                f"**Type:** {group_type.upper()}\n"
-                f"**Identifier:** `{identifier}`\n\n"
-                f"Use `/start_vc {group_id}` to start voice chat."
-            )
-        else:
-            await callback_query.message.reply_text("⏰ Timeout or invalid input.")
-        
-        await callback_query.answer()
-
-@bot.on_message(filters.command("list_groups"))
-async def list_groups_command(client: Client, message: Message):
-    groups = db.get_all_groups()
-    
-    if not groups:
-        await message.reply_text("❌ No groups configured. Use `/add_group` first.")
-        return
-    
-    text = "**📋 Configured Groups:**\n\n"
-    for group_id, config in groups.items():
-        text += f"**ID:** `{group_id}`\n"
-        text += f"**Type:** {config['type'].upper()}\n"
-        text += f"**Identifier:** `{config['identifier']}`\n"
-        text += f"**Status:** {'🟢 Active' if config.get('active', True) else '🔴 Inactive'}\n"
-        text += "──────────────────\n"
-    
-    text += "\nUse `/start_vc <group_id>` to start VC\n"
-    text += "Use `/stop_vc <group_id>` to stop VC"
-    
-    await message.reply_text(text)
-
-@bot.on_message(filters.command("start_vc"))
-async def start_vc_command(client: Client, message: Message):
-    if not accounts_loaded:
-        await initialize_vc()
-    
-    if vc_mgr is None or not vc_mgr.clients:
-        await message.reply_text("❌ No accounts loaded! Use `/add_account` first.")
-        return
-    
-    # Get group ID from command
-    parts = message.text.split()
-    if len(parts) < 2:
-        # Show list of available groups
-        groups = db.get_all_groups()
-        if not groups:
-            await message.reply_text("❌ No groups configured. Use `/add_group` first.")
-            return
-        
-        keyboard = []
-        for group_id, config in groups.items():
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"{config['type'].upper()}: {config['identifier'][:20]}", 
-                    callback_data=f"start_vc_{group_id}"
-                )
-            ])
-        
-        await message.reply_text(
-            "**Select group to start VC:**",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-    
-    group_id = parts[1]
-    group_config = db.get_group(group_id)
-    
-    if not group_config:
-        await message.reply_text(f"❌ Group `{group_id}` not found. Use `/add_group` first.")
-        return
-    
-    await message.reply_text(f"🎙️ Starting all accounts in VC for group `{group_id}`...")
-    success_count = await vc_mgr.start_all_for_group(group_config, group_id)
-    await message.reply_text(f"✅ {success_count} accounts joined the VC!")
-
-@bot.on_message(filters.command("stop_vc"))
-async def stop_vc_command(client: Client, message: Message):
-    parts = message.text.split()
-    
-    if len(parts) < 2:
-        # Show list of active groups
-        if not vc_mgr or not vc_mgr.active_sessions:
-            await message.reply_text("❌ No active VC sessions.")
-            return
-        
-        keyboard = []
-        for group_id in vc_mgr.active_sessions.keys():
-            if vc_mgr.active_sessions[group_id]:
-                config = db.get_group(group_id)
-                if config:
-                    keyboard.append([
-                        InlineKeyboardButton(
-                            f"{config['type'].upper()}: {config['identifier'][:20]}", 
-                            callback_data=f"stop_vc_{group_id}"
-                        )
-                    ])
-        
-        if not keyboard:
-            await message.reply_text("❌ No active VC sessions.")
-            return
-        
-        await message.reply_text(
-            "**Select group to stop VC:**",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-    
-    group_id = parts[1]
-    
-    if vc_mgr and group_id in vc_mgr.active_sessions:
-        await vc_mgr.stop_all_for_group(group_id)
-        await message.reply_text(f"✅ All accounts left VC for group `{group_id}`.")
-    else:
-        await message.reply_text(f"❌ No active VC session for group `{group_id}`.")
-
-@bot.on_message(filters.command("status"))
-async def status_command(client: Client, message: Message):
-    if vc_mgr and vc_mgr.clients:
-        text = f"📊 **Bot Status**\n\n"
-        text += f"**Total accounts loaded:** {len(vc_mgr.clients)}\n"
-        
-        active_groups = len([g for g in vc_mgr.active_sessions if vc_mgr.active_sessions[g]])
-        text += f"**Active groups:** {active_groups}\n\n"
-        
-        if active_groups > 0:
-            text += "**Active VC Sessions:**\n"
-            for group_id, sessions in vc_mgr.active_sessions.items():
-                if sessions:
-                    config = db.get_group(group_id)
-                    if config:
-                        text += f"• `{group_id}` - {config['type'].upper()}: {config['identifier'][:30]}\n"
-                        text += f"  👥 {len(sessions)} accounts in VC\n"
-        
-        text += "\n**Loaded Accounts:**\n"
-        for idx, c in enumerate(vc_mgr.clients, 1):
             try:
-                me = await c.get_me()
-                text += f"{idx}. {me.first_name} (@{me.username or 'no username'})\n"
-            except:
-                text += f"{idx}. Unknown account\n"
-        
-        await message.reply_text(text)
-    else:
-        await message.reply_text("❌ No active accounts. Use `/add_account` first.")
+                await vc.start(chat_id)
+                active_vc[acc_name] = {"vc": vc, "group_id": chat_id, "group_name": group_name}
+                results.append({"success": True, "name": acc_name, "id": acc_id})
+                print(f"  ✅ {acc_name} joined {group_name}")
+            except Exception as e:
+                error_msg = str(e)
+                if "not active" in error_msg.lower():
+                    results.append({"success": False, "name": acc_name, "id": acc_id, "error": "Voice chat not active!"})
+                elif "already" in error_msg.lower():
+                    results.append({"success": True, "name": acc_name, "id": acc_id})
+                    print(f"  ⚠️ {acc_name} already in VC")
+                else:
+                    results.append({"success": False, "name": acc_name, "id": acc_id, "error": error_msg[:50]})
+                print(f"  ❌ {acc_name} failed: {error_msg[:50]}")
+        except Exception as e:
+            results.append({"success": False, "name": acc_name, "id": acc_id, "error": str(e)[:50]})
+            print(f"  ❌ {acc_name} error: {e}")
+        await asyncio.sleep(2)
+    return results
 
-@bot.on_message(filters.command("remove_group"))
-async def remove_group_command(client: Client, message: Message):
-    parts = message.text.split()
+async def leave_specific_accounts(group_id, count):
+    results = []
+    accounts_to_leave = []
+    for name, data in active_vc.items():
+        if data["group_id"] == group_id:
+            accounts_to_leave.append(name)
     
-    if len(parts) < 2:
-        # Show list of groups
-        groups = db.get_all_groups()
-        if not groups:
-            await message.reply_text("❌ No groups configured.")
-            return
+    if not accounts_to_leave:
+        return results
+    
+    for name in accounts_to_leave[:count]:
+        try:
+            await active_vc[name]["vc"].leave()
+            results.append({"success": True, "name": name})
+            print(f"  ✅ {name} left")
+        except Exception as e:
+            results.append({"success": False, "name": name, "error": str(e)[:50]})
+            print(f"  ❌ {name} failed to leave: {e}")
         
-        keyboard = []
-        for group_id, config in groups.items():
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"{config['type'].upper()}: {config['identifier'][:20]}", 
-                    callback_data=f"remove_group_{group_id}"
-                )
-            ])
-        
-        await message.reply_text(
-            "**Select group to remove:**",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        if name in active_vc:
+            del active_vc[name]
+        await asyncio.sleep(1)
+    return results
+
+def show_leave_groups(chat_id):
+    groups_with_vc = {}
+    for name, data in active_vc.items():
+        group_name = data["group_name"]
+        group_id = data["group_id"]
+        if group_id not in groups_with_vc:
+            groups_with_vc[group_id] = {"name": group_name, "count": 0}
+        groups_with_vc[group_id]["count"] += 1
+    if not groups_with_vc:
+        send_message(chat_id, "❌ No active voice chats!")
         return
-    
-    group_id = parts[1]
-    
-    # Stop VC if active
-    if vc_mgr and group_id in vc_mgr.active_sessions:
-        await vc_mgr.stop_all_for_group(group_id)
-    
-    # Remove from database
-    db.remove_group(group_id)
-    await message.reply_text(f"✅ Group `{group_id}` removed successfully.")
+    keyboard = {"inline_keyboard": []}
+    for group_id, info in groups_with_vc.items():
+        keyboard["inline_keyboard"].append([
+            {"text": f"🎤 {info['name']} ({info['count']} accounts)", "callback_data": f"leave_group_{group_id}"}
+        ])
+    keyboard["inline_keyboard"].append([{"text": "❌ Cancel", "callback_data": "cancel_leave"}])
+    send_message(chat_id, "Select group to leave:", keyboard)
 
-@bot.on_message(filters.command("reset"))
-async def reset_command(client: Client, message: Message):
-    global vc_mgr, accounts_loaded
-    await message.reply_text("🔄 Reloading all accounts...")
-    
-    if vc_mgr:
-        # Stop all active sessions
-        for group_id in list(vc_mgr.active_sessions.keys()):
-            await vc_mgr.stop_all_for_group(group_id)
-    
-    vc_mgr = None
-    accounts_loaded = False
-    await initialize_vc()
-    
-    if accounts_loaded:
-        await message.reply_text(f"✅ Reloaded {len(acc_mgr.accounts)} accounts.")
-    else:
-        await message.reply_text("⚠️ No sessions found. Use `/add_account` first.")
-
-# Handle callback for start/stop/remove
-@bot.on_callback_query()
-async def handle_vc_callbacks(client: Client, callback_query: CallbackQuery):
-    data = callback_query.data
-    
-    if data.startswith("start_vc_"):
-        group_id = data.replace("start_vc_", "")
-        group_config = db.get_group(group_id)
-        
-        if not group_config:
-            await callback_query.answer("Group not found!", show_alert=True)
-            return
-        
-        if not accounts_loaded:
-            await initialize_vc()
-        
-        if not vc_mgr or not vc_mgr.clients:
-            await callback_query.answer("No accounts loaded!", show_alert=True)
-            return
-        
-        await callback_query.message.reply_text(f"🎙️ Starting VC for group `{group_id}`...")
-        success_count = await vc_mgr.start_all_for_group(group_config, group_id)
-        await callback_query.message.reply_text(f"✅ {success_count} accounts joined the VC!")
-        await callback_query.answer()
-    
-    elif data.startswith("stop_vc_"):
-        group_id = data.replace("stop_vc_", "")
-        
-        if vc_mgr and group_id in vc_mgr.active_sessions:
-            await vc_mgr.stop_all_for_group(group_id)
-            await callback_query.message.reply_text(f"✅ Stopped VC for group `{group_id}`.")
-        else:
-            await callback_query.answer("No active session for this group!", show_alert=True)
-        await callback_query.answer()
-    
-    elif data.startswith("remove_group_"):
-        group_id = data.replace("remove_group_", "")
-        
-        if vc_mgr and group_id in vc_mgr.active_sessions:
-            await vc_mgr.stop_all_for_group(group_id)
-        
-        db.remove_group(group_id)
-        await callback_query.message.reply_text(f"✅ Group `{group_id}` removed.")
-        await callback_query.answer()
+def show_all_sessions(chat_id):
+    if not user_sessions:
+        send_message(chat_id, "❌ No sessions added!")
+        return
+    text = "**📱 Your Sessions:**\n\n"
+    for i, s in enumerate(user_sessions, 1):
+        status = "✅ Connected" if s['name'] in user_clients else "⭕ Not Connected"
+        text += f"{i}. **{s['name']}**\n"
+        text += f"   🆔 ID: `{s['id']}`\n"
+        text += f"   📊 Status: {status}\n\n"
+    send_message(chat_id, text)
 
 async def main():
-    print("🤖 Starting Bot...")
-    await bot.start()
-    print("✅ Bot is running!")
-    await initialize_vc()
-    await asyncio.Event().wait()
+    global last_update_id, current_group
+    while True:
+        try:
+            response = requests.get(f"{API_URL}/getUpdates", params={"offset": last_update_id + 1, "timeout": 30}, timeout=35)
+            if response.status_code != 200:
+                time.sleep(5)
+                continue
+            data = response.json()
+            if not data.get("ok"):
+                time.sleep(5)
+                continue
+            for update in data.get("result", []):
+                last_update_id = update["update_id"]
+                
+                if "callback_query" in update:
+                    callback = update["callback_query"]
+                    user_id = callback["from"]["id"]
+                    chat_id = callback["message"]["chat"]["id"]
+                    data_cb = callback["data"]
+                    print(f"\n📞 Callback: {data_cb}")
+                    
+                    if user_id != OWNER_ID:
+                        send_message(chat_id, "❌ Access Denied! Only bot owner can use this bot.")
+                        requests.post(f"{API_URL}/answerCallbackQuery", json={"callback_query_id": callback["id"]})
+                        continue
+                    
+                    if data_cb == "connect":
+                        user_states[user_id] = {"step": "awaiting_session"}
+                        send_message(chat_id, "📱 **Send Pyrogram String Session**\n\nGet from @StringSessionBot\nType `/done` when finished")
+                    
+                    elif data_cb == "status":
+                        status_text = f"**📊 Status**\n\n"
+                        status_text += f"📱 Sessions: {len(user_sessions)}\n"
+                        status_text += f"🔌 Connected: {len(user_clients)}\n"
+                        status_text += f"🎤 Active VC: {len(active_vc)}\n"
+                        status_text += f"📋 Groups: {len(groups_list)}\n\n"
+                        if user_sessions:
+                            status_text += "**Sessions:**\n"
+                            for s in user_sessions:
+                                status = "✅" if s['name'] in user_clients else "⭕"
+                                status_text += f"{status} `{s['name']}`\n"
+                        if active_vc:
+                            status_text += "\n**Active in VC:**\n"
+                            for name, d in active_vc.items():
+                                status_text += f"🎤 `{name}` in `{d['group_name']}`\n"
+                        send_message(chat_id, status_text)
+                    
+                    elif data_cb == "public_group":
+                        user_states[user_id] = {"step": "public_username"}
+                        send_message(chat_id, "📝 Send group @username\nExample: `@mygroup`")
+                    
+                    elif data_cb == "private_group":
+                        user_states[user_id] = {"step": "private_link"}
+                        send_message(chat_id, "🔗 Send invite link")
+                    
+                    elif data_cb == "show_groups":
+                        if not groups_list:
+                            send_message(chat_id, "No groups added! Use /add")
+                        else:
+                            keyboard = {"inline_keyboard": []}
+                            for i, grp in enumerate(groups_list):
+                                keyboard["inline_keyboard"].append([
+                                    {"text": f"📌 {grp['name']}", "callback_data": f"select_group_{i}"}
+                                ])
+                            send_message(chat_id, "Your Groups:", keyboard)
+                    
+                    elif data_cb == "show_sessions":
+                        show_all_sessions(chat_id)
+                    
+                    elif data_cb.startswith("select_group_"):
+                        idx = int(data_cb.split("_")[2])
+                        if idx < len(groups_list):
+                            current_group = groups_list[idx]
+                            send_message(chat_id, f"✅ Switched to: {current_group['name']}")
+                    
+                    elif data_cb == "leave_vc":
+                        show_leave_groups(chat_id)
+                    
+                    elif data_cb.startswith("leave_group_"):
+                        gid = int(data_cb.split("_")[2])
+                        gname = None
+                        tcount = 0
+                        for name, d in active_vc.items():
+                            if d["group_id"] == gid:
+                                gname = d["group_name"]
+                                tcount += 1
+                        if gname:
+                            leave_selected_group[user_id] = {"group_id": gid, "group_name": gname, "total": tcount}
+                            send_message(chat_id, f"🎤 Group: {gname}\n👥 Active: {tcount}\n\nSend number of accounts to leave (1-{tcount}):")
+                    
+                    elif data_cb == "cancel_leave":
+                        send_message(chat_id, "❌ Cancelled")
+                        if user_id in leave_selected_group:
+                            del leave_selected_group[user_id]
+                    
+                    requests.post(f"{API_URL}/answerCallbackQuery", json={"callback_query_id": callback["id"]})
+                
+                elif "message" in update:
+                    msg = update["message"]
+                    user_id = msg["from"]["id"]
+                    chat_id = msg["chat"]["id"]
+                    text = msg.get("text", "")
+                    print(f"\n📨 Message: {text}")
+                    
+                    if user_id != OWNER_ID:
+                        continue
+                    
+                    # Handle leave count input
+                    if user_id in leave_selected_group:
+                        try:
+                            count = int(text)
+                            group_info = leave_selected_group[user_id]
+                            if count <= 0:
+                                send_message(chat_id, "❌ Count must be greater than 0!")
+                            elif count > group_info["total"]:
+                                send_message(chat_id, f"❌ Only {group_info['total']} accounts active!")
+                            else:
+                                send_message(chat_id, f"🚪 Leaving {count} accounts...")
+                                results = await leave_specific_accounts(group_info["group_id"], count)
+                                scount = sum(1 for r in results if r["success"])
+                                if scount > 0:
+                                    send_message(chat_id, f"✅ Left {scount} accounts from {group_info['group_name']}")
+                                else:
+                                    send_message(chat_id, f"❌ Failed to leave accounts!")
+                                del leave_selected_group[user_id]
+                        except ValueError:
+                            send_message(chat_id, "❌ Please send a valid number!")
+                        continue
+                    
+                    # Regular commands
+                    if text == "/start":
+                        kb = {"inline_keyboard": [
+                            [{"text": "🔌 Connect Session", "callback_data": "connect"}],
+                            [{"text": "📊 Status", "callback_data": "status"}],
+                            [{"text": "📱 My Sessions", "callback_data": "show_sessions"}],
+                            [{"text": "➕ Add Group", "callback_data": "public_group"}],
+                            [{"text": "📋 Groups", "callback_data": "show_groups"}],
+                            [{"text": "🚪 Leave VC", "callback_data": "leave_vc"}]
+                        ]}
+                        send_message(chat_id, "**🎵 VC Manager Bot**\n\n**Commands:**\n/add - Add group\n/joinvc <count> - Join VC\n/leavevc - Smart leave\n/groups - All groups\n/sessions - All sessions\n/status - Status\n/done - Done", kb)
+                    
+                    elif text == "/add":
+                        kb = {"inline_keyboard": [
+                            [{"text": "🌐 Public", "callback_data": "public_group"}],
+                            [{"text": "🔒 Private", "callback_data": "private_group"}]
+                        ]}
+                        send_message(chat_id, "Select type:", kb)
+                    
+                    elif text == "/groups":
+                        if not groups_list:
+                            send_message(chat_id, "No groups added! Use /add")
+                        else:
+                            kb = {"inline_keyboard": []}
+                            for i, grp in enumerate(groups_list):
+                                kb["inline_keyboard"].append([{"text": f"📌 {grp['name']}", "callback_data": f"select_group_{i}"}])
+                            send_message(chat_id, "Your Groups:", kb)
+                    
+                    elif text == "/sessions":
+                        show_all_sessions(chat_id)
+                    
+                    elif text == "/leavevc":
+                        show_leave_groups(chat_id)
+                    
+                    elif text.startswith("/joinvc"):
+                        parts = text.split()
+                        if len(parts) != 2:
+                            send_message(chat_id, "Usage: /joinvc <count>\nExample: /joinvc 5")
+                            continue
+                        try:
+                            count = int(parts[1])
+                        except:
+                            send_message(chat_id, "Invalid count!")
+                            continue
+                        
+                        if not current_group:
+                            send_message(chat_id, "No group selected! Use /groups")
+                            continue
+                        if len(user_sessions) == 0:
+                            send_message(chat_id, "No sessions added! Use /start to add sessions")
+                            continue
+                        if count > len(user_sessions):
+                            send_message(chat_id, f"Only {len(user_sessions)} sessions available!")
+                            continue
+                        
+                        send_message(chat_id, f"🎤 Joining {count} accounts to {current_group['name']}...")
+                        results = await join_voice_chat(current_group["chat_id"], current_group["name"], count)
+                        
+                        scount = sum(1 for r in results if r["success"])
+                        msg_text = f"**✅ Joined: {scount}/{count}**\n\n"
+                        for r in results:
+                            if r["success"]:
+                                msg_text += f"✅ {r['name']}\n"
+                            else:
+                                msg_text += f"❌ {r['name']}: {r['error']}\n"
+                        send_message(chat_id, msg_text)
+                    
+                    elif text == "/status":
+                        status_text = f"**📊 Status**\n\n"
+                        status_text += f"📱 Sessions: {len(user_sessions)}\n"
+                        status_text += f"🔌 Connected: {len(user_clients)}\n"
+                        status_text += f"🎤 Active VC: {len(active_vc)}\n"
+                        status_text += f"📋 Groups: {len(groups_list)}\n"
+                        if current_group:
+                            status_text += f"\n📍 Current: {current_group['name']}"
+                        send_message(chat_id, status_text)
+                    
+                    elif text == "/done":
+                        send_message(chat_id, f"✅ Done! Total sessions: {len(user_sessions)}")
+                        if user_id in user_states:
+                            del user_states[user_id]
+                    
+                    # Handle session string input
+                    elif user_id in user_states and user_states[user_id].get("step") == "awaiting_session":
+                        if len(text) > 50:
+                            send_message(chat_id, "⏳ Testing session...")
+                            result = await test_session(text)
+                            if result["success"]:
+                                # Check if session already exists
+                                exists = False
+                                for s in user_sessions:
+                                    if s["id"] == result["id"]:
+                                        exists = True
+                                        break
+                                if exists:
+                                    send_message(chat_id, f"⚠️ Session for {result['name']} already exists!")
+                                else:
+                                    user_sessions.append({
+                                        "string": text,
+                                        "name": result["name"],
+                                        "id": result["id"],
+                                        "username": result["username"]
+                                    })
+                                    send_message(chat_id, f"✅ **Session Added!**\n\n👤 {result['name']}\n🆔 `{result['id']}`\n📊 Total: {len(user_sessions)}\n\nSend more or type /done")
+                            else:
+                                send_message(chat_id, f"❌ Invalid session: {result['error']}")
+                        else:
+                            send_message(chat_id, "❌ Invalid session string!")
+                    
+                    # Handle public group username
+                    elif user_id in user_states and user_states[user_id].get("step") == "public_username":
+                        username = text.replace("@", "")
+                        send_message(chat_id, f"⏳ Resolving @{username}...")
+                        try:
+                            resp = requests.get(f"{API_URL}/getChat", params={"chat_id": f"@{username}"}, timeout=10)
+                            if resp.ok:
+                                ci = resp.json()["result"]
+                                gtitle = ci.get("title", username)
+                                gcid = ci["id"]
+                                groups_list.append({"name": gtitle, "chat_id": gcid, "username": username})
+                                current_group = groups_list[-1]
+                                send_message(chat_id, f"✅ **Group Added!**\n\n📌 {gtitle}\n🆔 `{gcid}`\n\nUse /joinvc <count> to join voice chat")
+                            else:
+                                send_message(chat_id, f"❌ Could not resolve @{username}\n\nMake sure the username is correct and accounts are added to the group.")
+                        except Exception as e:
+                            send_message(chat_id, f"❌ Error: {e}")
+                        del user_states[user_id]
+                    
+                    # Handle private group link
+                    elif user_id in user_states and user_states[user_id].get("step") == "private_link":
+                        user_states[user_id] = {"step": "private_chatid", "link": text}
+                        send_message(chat_id, "Send Chat ID (example: -1001234567890)")
+                    
+                    # Handle private group chat_id
+                    elif user_id in user_states and user_states[user_id].get("step") == "private_chatid":
+                        try:
+                            cid = int(text)
+                            groups_list.append({"name": f"Private_{cid}", "chat_id": cid, "invite_link": user_states[user_id]["link"]})
+                            current_group = groups_list[-1]
+                            send_message(chat_id, f"✅ **Private Group Added!**\n\n🆔 `{cid}`\n\nUse /joinvc <count> to join voice chat")
+                            del user_states[user_id]
+                        except:
+                            send_message(chat_id, "Invalid Chat ID!")
+        
+        except Exception as e:
+            print(f"Error: {e}")
+            time.sleep(5)
 
 if __name__ == "__main__":
     asyncio.run(main())
