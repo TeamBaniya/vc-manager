@@ -12,7 +12,6 @@ from config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID
 TOKEN = BOT_TOKEN
 API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
-
 user_sessions = []
 user_clients = {}
 active_vc = {}
@@ -24,7 +23,7 @@ leave_selected_group = {}
 temp_session_data = {}
 
 print("="*60)
-print("🤖 VC BOT - WITH OTP AUTO READ")
+print("🤖 VC BOT - FIXED OTP")
 print("="*60)
 print("Bot started! Send /start on Telegram\n")
 
@@ -39,9 +38,7 @@ def send_message(chat_id, text, reply_markup=None):
 
 def extract_otp(text):
     """Extract OTP from text (removes spaces, special characters)"""
-    # Remove spaces and special characters
     cleaned = re.sub(r'[\s\-_]+', '', text)
-    # Extract only digits
     digits = re.sub(r'\D', '', cleaned)
     return digits
 
@@ -66,8 +63,8 @@ async def create_new_session(phone_number, chat_id):
             "phone_code_hash": sent_code.phone_code_hash,
             "step": "waiting_otp"
         }
-        send_message(chat_id, f"📨 **OTP Sent!**\n\nPhone: `{phone_number}`\n\nPlease send the OTP code you received on Telegram.\n\nExample: `1 2 3 4 5` or `12345`\n\n⏰ OTP expires in 60 seconds.")
-        print(f"OTP sent to {phone_number} for chat {chat_id}")
+        send_message(chat_id, f"📨 **OTP Sent!**\n\nPhone: `{phone_number}`\n\nPlease send the OTP code you received.\n\nExample: `1 2 3 4 5` or `12345`")
+        print(f"OTP sent to {phone_number}")
         return True
     except Exception as e:
         send_message(chat_id, f"❌ Error: {str(e)}")
@@ -75,15 +72,14 @@ async def create_new_session(phone_number, chat_id):
 
 async def verify_session_otp(chat_id, raw_code):
     if chat_id not in temp_session_data:
-        send_message(chat_id, "❌ Session expired! Please start over with /start")
+        send_message(chat_id, "❌ Session expired! Please start over.")
         return False
     
-    # Extract OTP from text (remove spaces, special chars)
     code = extract_otp(raw_code)
     print(f"📱 Extracted OTP: {code} from: {raw_code}")
     
     if not code or len(code) < 5:
-        send_message(chat_id, f"❌ **Invalid OTP Format!**\n\nYou sent: `{raw_code}`\nExtracted: `{code}`\n\nOTP should be 5-6 digits.\n\nPlease send again:")
+        send_message(chat_id, f"❌ **Invalid OTP!**\n\nYou sent: `{raw_code}`\nExtracted: `{code}`\n\nOTP should be 5-6 digits.\n\nPlease send again:")
         return False
     
     data = temp_session_data[chat_id]
@@ -91,9 +87,14 @@ async def verify_session_otp(chat_id, raw_code):
     
     try:
         send_message(chat_id, f"⏳ Verifying OTP `{code}`...")
-        print(f"Verifying OTP: {code} for {data['phone']}")
         
-        await client.sign_in(data["phone"], code, phone_code_hash=data["phone_code_hash"])
+        # FIXED: Correct way to sign in
+        await client.sign_in(
+            phone_number=data["phone"],
+            code=code,
+            phone_code_hash=data["phone_code_hash"]
+        )
+        
         me = await client.get_me()
         
         session_string = await client.export_session_string()
@@ -119,12 +120,14 @@ async def verify_session_otp(chat_id, raw_code):
         temp_session_data[chat_id]["step"] = "waiting_2fa"
         send_message(chat_id, "🔐 **2FA Enabled**\n\nPlease send your 2FA password:")
         return False
-    except PhoneCodeInvalid:
-        send_message(chat_id, f"❌ **Invalid OTP!** `{code}` is not correct.\n\nPlease check your Telegram app and send the correct OTP code again:")
+    except PhoneCodeInvalid as e:
+        send_message(chat_id, f"❌ **Invalid OTP!** `{code}` is not correct.\n\nPlease check your Telegram app and send the correct OTP code:")
+        print(f"Invalid OTP: {e}")
         return False
-    except PhoneCodeExpired:
+    except PhoneCodeExpired as e:
         send_message(chat_id, "❌ **OTP Expired!** Please start over with /start")
         del temp_session_data[chat_id]
+        print(f"OTP Expired: {e}")
         return False
     except Exception as e:
         error_msg = str(e)
