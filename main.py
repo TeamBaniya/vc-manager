@@ -3,6 +3,7 @@ import time
 import json
 import asyncio
 import os
+import re
 from pyrogram import Client
 from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired
 from pytgcalls import GroupCallFactory
@@ -22,7 +23,7 @@ leave_selected_group = {}
 temp_session_data = {}
 
 print("="*60)
-print("🤖 VC BOT - WITH SESSION CREATION")
+print("🤖 VC BOT - WITH OTP AUTO READ")
 print("="*60)
 print("Bot started! Send /start on Telegram\n")
 
@@ -34,6 +35,14 @@ def send_message(chat_id, text, reply_markup=None):
         requests.post(f"{API_URL}/sendMessage", json=data, timeout=5)
     except:
         pass
+
+def extract_otp(text):
+    """Extract OTP from text (removes spaces, special characters)"""
+    # Remove spaces and special characters
+    cleaned = re.sub(r'[\s\-_]+', '', text)
+    # Extract only digits
+    digits = re.sub(r'\D', '', cleaned)
+    return digits
 
 async def test_session(session_string):
     try:
@@ -56,15 +65,23 @@ async def create_new_session(phone_number, chat_id):
             "phone_code_hash": sent_code.phone_code_hash,
             "step": "waiting_otp"
         }
-        send_message(chat_id, "📨 **OTP Sent!**\n\nPlease send the OTP code you received on Telegram:")
+        send_message(chat_id, "📨 **OTP Sent!**\n\nPlease send the OTP code you received on Telegram.\n\nExample: `1 2 3 4 5` or `12345`")
         return True
     except Exception as e:
         send_message(chat_id, f"❌ Error: {str(e)}")
         return False
 
-async def verify_session_otp(chat_id, code):
+async def verify_session_otp(chat_id, raw_code):
     if chat_id not in temp_session_data:
         send_message(chat_id, "❌ Session expired! Please start over.")
+        return False
+    
+    # Extract OTP from text (remove spaces, special chars)
+    code = extract_otp(raw_code)
+    print(f"Extracted OTP: {code} from: {raw_code}")
+    
+    if not code or len(code) < 5:
+        send_message(chat_id, "❌ **Invalid OTP!**\n\nPlease send the OTP code again.\nExample: `1 2 3 4 5` or `12345`")
         return False
     
     data = temp_session_data[chat_id]
@@ -98,7 +115,7 @@ async def verify_session_otp(chat_id, code):
         send_message(chat_id, "🔐 **2FA Enabled**\n\nPlease send your 2FA password:")
         return False
     except PhoneCodeInvalid:
-        send_message(chat_id, "❌ **Invalid OTP!** Please try again.\n\nSend OTP code:")
+        send_message(chat_id, "❌ **Invalid OTP!** Please try again.\n\nSend OTP code (spaces allowed):")
         return False
     except PhoneCodeExpired:
         send_message(chat_id, "❌ **OTP Expired!** Please start over with /start")
@@ -375,13 +392,9 @@ async def main():
                             send_message(chat_id, "❌ Invalid phone number! Example: +919876543210")
                         continue
                     
-                    # Handle OTP input
+                    # Handle OTP input - FIXED: Auto read OTP
                     if chat_id in temp_session_data and temp_session_data[chat_id].get("step") == "waiting_otp":
-                        code = text.strip().replace(" ", "")
-                        if code.isdigit():
-                            await verify_session_otp(chat_id, code)
-                        else:
-                            send_message(chat_id, "❌ Please send only numbers!")
+                        await verify_session_otp(chat_id, text)
                         continue
                     
                     # Handle 2FA input
