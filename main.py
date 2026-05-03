@@ -5,6 +5,7 @@ import asyncio
 import os
 from pyrogram import Client
 from pytgcalls import GroupCallFactory
+from database import db
 from config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID
 
 TOKEN = BOT_TOKEN
