@@ -37,7 +37,6 @@ def send_message(chat_id, text, reply_markup=None):
         print(f"Send error: {e}")
 
 def extract_otp(text):
-    """Extract OTP from text (removes spaces, special characters)"""
     cleaned = re.sub(r'[\s\-_]+', '', text)
     digits = re.sub(r'\D', '', cleaned)
     return digits
@@ -88,12 +87,8 @@ async def verify_session_otp(chat_id, raw_code):
     try:
         send_message(chat_id, f"⏳ Verifying OTP `{code}`...")
         
-        # FIXED: Correct way to sign in
-        await client.sign_in(
-            phone_number=data["phone"],
-            code=code,
-            phone_code_hash=data["phone_code_hash"]
-        )
+        # FIXED: Correct way - sign_in with only code (phone_code_hash is stored in client)
+        await client.sign_in(code=code)
         
         me = await client.get_me()
         
