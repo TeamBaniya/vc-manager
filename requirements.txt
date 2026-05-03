@@ -1,3 +1,4 @@
-Pyrogram==2.0.106
-PyTgCalls==5.1.1
-asyncio
+pyrogram==2.0.106
+pytgcalls==3.0.0.dev24
+requests==2.31.0
+tgcrypto==1.2.5
