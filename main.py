@@ -19,7 +19,7 @@ current_group = None
 last_update_id = 0
 user_states = {}
 leave_selected_group = {}
-temp_session_data = {}  # For storing session creation temp data
+temp_session_data = {}
 
 print("="*60)
 print("🤖 VC BOT - WITH SESSION CREATION")
@@ -46,7 +46,6 @@ async def test_session(session_string):
         return {"success": False, "error": str(e)}
 
 async def create_new_session(phone_number, chat_id):
-    """Create new session using phone number"""
     try:
         client = Client(f"new_session_{phone_number}", api_id=API_ID, api_hash=API_HASH)
         await client.connect()
@@ -75,10 +74,8 @@ async def verify_session_otp(chat_id, code):
         await client.sign_in(data["phone"], code, phone_code_hash=data["phone_code_hash"])
         me = await client.get_me()
         
-        # Get session string
         session_string = await client.export_session_string()
         
-        # Store in user_sessions
         user_sessions.append({
             "string": session_string,
             "name": me.first_name,
@@ -86,7 +83,6 @@ async def verify_session_otp(chat_id, code):
             "username": me.username or ""
         })
         
-        # Show success message with inline button to connect
         kb = {"inline_keyboard": [
             [{"text": "✅ Tap to Connect", "callback_data": f"connect_session_{len(user_sessions)-1}"}]
         ]}
@@ -147,7 +143,6 @@ async def verify_session_2fa(chat_id, password):
         return False
 
 async def connect_session(chat_id, session_index):
-    """Connect a session (create client and join VC if needed)"""
     if session_index >= len(user_sessions):
         send_message(chat_id, "❌ Session not found!")
         return
@@ -162,13 +157,12 @@ async def connect_session(chat_id, session_index):
             await client.start()
             user_clients[acc_name] = client
             
-            # Initialize voice call
             factory = GroupCallFactory(client)
             vc = factory.get_file_group_call()
             await vc.start()
             user_clients[f"{acc_name}_vc"] = vc
             
-            send_message(chat_id, f"✅ **Connected!**\n\n👤 {acc_name} is now online and ready to join voice chats!\n\nUse `/joinvc <count>` to join voice chat.")
+            send_message(chat_id, f"✅ **Connected!**\n\n👤 {acc_name} is now online!\n\nUse `/joinvc <count>` to join voice chat.")
         else:
             send_message(chat_id, f"✅ {acc_name} is already connected!")
     except Exception as e:
@@ -176,13 +170,13 @@ async def connect_session(chat_id, session_index):
 
 async def join_voice_chat(chat_id, group_name, count):
     results = []
-    connected_count = 0
     
-    # First connect sessions that are not connected
     for i, session_data in enumerate(user_sessions[:count]):
         acc_name = session_data["name"]
-        if acc_name not in user_clients:
-            try:
+        acc_id = session_data["id"]
+        
+        try:
+            if acc_name not in user_clients:
                 client = Client(f"sessions/{acc_name}", api_id=API_ID, api_hash=API_HASH, session_string=session_data["string"])
                 await client.start()
                 user_clients[acc_name] = client
@@ -190,17 +184,7 @@ async def join_voice_chat(chat_id, group_name, count):
                 vc = factory.get_file_group_call()
                 await vc.start()
                 user_clients[f"{acc_name}_vc"] = vc
-                connected_count += 1
-            except Exception as e:
-                print(f"Failed to connect {acc_name}: {e}")
-    
-    # Now join voice chat
-    for i, session_data in enumerate(user_sessions[:count]):
-        session_string = session_data["string"]
-        acc_name = session_data["name"]
-        acc_id = session_data["id"]
-        
-        try:
+            
             vc = user_clients.get(f"{acc_name}_vc")
             if not vc:
                 results.append({"success": False, "name": acc_name, "id": acc_id, "error": "Not connected!"})
@@ -229,7 +213,7 @@ async def leave_specific_accounts(group_id, count):
             accounts_to_leave.append(name)
     for name in accounts_to_leave[:count]:
         try:
-            await active_vc[name]["vc"].leave()
+            await active_vc[name]["vc"].stop()
             results.append({"success": True, "name": name})
             print(f"  ✅ {name} left")
         except Exception as e:
@@ -258,283 +242,282 @@ def show_leave_groups(chat_id):
     keyboard["inline_keyboard"].append([{"text": "❌ Cancel", "callback_data": "cancel_leave"}])
     send_message(chat_id, "Select group to leave:", keyboard)
 
-while True:
-    try:
-        response = requests.get(f"{API_URL}/getUpdates", params={"offset": last_update_id + 1, "timeout": 30}, timeout=35)
-        if response.status_code != 200:
-            time.sleep(5)
-            continue
-        data = response.json()
-        if not data.get("ok"):
-            time.sleep(5)
-            continue
-        for update in data.get("result", []):
-            last_update_id = update["update_id"]
-            if "callback_query" in update:
-                callback = update["callback_query"]
-                user_id = callback["from"]["id"]
-                chat_id = callback["message"]["chat"]["id"]
-                data_cb = callback["data"]
-                print(f"\n📞 Callback: {data_cb}")
+async def handle_callback(chat_id, user_id, data_cb):
+    if data_cb.startswith("connect_session_"):
+        idx = int(data_cb.split("_")[2])
+        await connect_session(chat_id, idx)
+    
+    elif data_cb == "connect_existing":
+        user_states[user_id] = {"step": "awaiting_session"}
+        send_message(chat_id, "📱 **Send Pyrogram String Session**\n\nGet from @StringSessionBot\nType `/done` when finished")
+    
+    elif data_cb == "create_new_session":
+        send_message(chat_id, "📱 **Create New Session**\n\nSend your phone number with country code:\nExample: `+919876543210`")
+        user_states[user_id] = {"step": "waiting_phone"}
+    
+    elif data_cb == "status":
+        status_text = f"**📊 Status**\nSessions: {len(user_sessions)}\nActive VC: {len(active_vc)}\nGroups: {len(groups_list)}"
+        send_message(chat_id, status_text)
+    
+    elif data_cb == "public_group":
+        user_states[user_id] = {"step": "public_username"}
+        send_message(chat_id, "📝 Send group @username")
+    
+    elif data_cb == "private_group":
+        user_states[user_id] = {"step": "private_link"}
+        send_message(chat_id, "🔗 Send invite link")
+    
+    elif data_cb == "show_groups":
+        if not groups_list:
+            send_message(chat_id, "No groups added! Use /add")
+        else:
+            keyboard = {"inline_keyboard": []}
+            for i, grp in enumerate(groups_list):
+                keyboard["inline_keyboard"].append([
+                    {"text": f"📌 {grp['name']}", "callback_data": f"select_group_{i}"}
+                ])
+            send_message(chat_id, "Your Groups:", keyboard)
+    
+    elif data_cb.startswith("select_group_"):
+        idx = int(data_cb.split("_")[2])
+        if idx < len(groups_list):
+            global current_group
+            current_group = groups_list[idx]
+            send_message(chat_id, f"✅ Switched to: {current_group['name']}")
+    
+    elif data_cb == "leave_vc":
+        show_leave_groups(chat_id)
+    
+    elif data_cb.startswith("leave_group_"):
+        gid = int(data_cb.split("_")[2])
+        gname = None
+        tcount = 0
+        for name, d in active_vc.items():
+            if d["group_id"] == gid:
+                gname = d["group_name"]
+                tcount += 1
+        if gname:
+            leave_selected_group[user_id] = {"group_id": gid, "group_name": gname, "total": tcount}
+            send_message(chat_id, f"🎤 Group: {gname}\n👥 Active accounts: {tcount}\n\n📝 **Send number of accounts to leave** (1 to {tcount})")
+    
+    elif data_cb == "cancel_leave":
+        send_message(chat_id, "❌ Cancelled")
+        if user_id in leave_selected_group:
+            del leave_selected_group[user_id]
+
+async def main():
+    global last_update_id, current_group
+    while True:
+        try:
+            response = requests.get(f"{API_URL}/getUpdates", params={"offset": last_update_id + 1, "timeout": 30}, timeout=35)
+            if response.status_code != 200:
+                time.sleep(5)
+                continue
+            data = response.json()
+            if not data.get("ok"):
+                time.sleep(5)
+                continue
+            for update in data.get("result", []):
+                last_update_id = update["update_id"]
                 
-                # Handle connect session
-                if data_cb.startswith("connect_session_"):
-                    idx = int(data_cb.split("_")[2])
-                    await connect_session(chat_id, idx)
+                if "callback_query" in update:
+                    callback = update["callback_query"]
+                    user_id = callback["from"]["id"]
+                    chat_id = callback["message"]["chat"]["id"]
+                    data_cb = callback["data"]
+                    print(f"\n📞 Callback: {data_cb}")
+                    
+                    if user_id != OWNER_ID:
+                        send_message(chat_id, "❌ Access Denied! Only bot owner can use this bot.")
+                        requests.post(f"{API_URL}/answerCallbackQuery", json={"callback_query_id": callback["id"]})
+                        continue
+                    
+                    await handle_callback(chat_id, user_id, data_cb)
+                    requests.post(f"{API_URL}/answerCallbackQuery", json={"callback_query_id": callback["id"]})
                 
-                elif data_cb == "connect_existing":
-                    user_states[user_id] = {"step": "awaiting_session"}
-                    send_message(chat_id, "📱 **Send Pyrogram String Session**\n\nGet from @StringSessionBot\nType `/done` when finished")
-                
-                elif data_cb == "create_new_session":
-                    send_message(chat_id, "📱 **Create New Session**\n\nSend your phone number with country code:\nExample: `+919876543210`")
-                    user_states[user_id] = {"step": "waiting_phone"}
-                
-                elif data_cb == "status":
-                    status_text = f"**📊 Status**\nSessions: {len(user_sessions)}\nActive VC: {len(active_vc)}\nGroups: {len(groups_list)}"
-                    send_message(chat_id, status_text)
-                
-                elif data_cb == "public_group":
-                    user_states[user_id] = {"step": "public_username"}
-                    send_message(chat_id, "📝 Send group @username")
-                
-                elif data_cb == "private_group":
-                    user_states[user_id] = {"step": "private_link"}
-                    send_message(chat_id, "🔗 Send invite link")
-                
-                elif data_cb == "show_groups":
-                    if not groups_list:
-                        send_message(chat_id, "No groups added! Use /add")
-                    else:
-                        keyboard = {"inline_keyboard": []}
-                        for i, grp in enumerate(groups_list):
-                            keyboard["inline_keyboard"].append([
-                                {"text": f"📌 {grp['name']}", "callback_data": f"select_group_{i}"}
-                            ])
-                        send_message(chat_id, "Your Groups:", keyboard)
-                
-                elif data_cb.startswith("select_group_"):
-                    idx = int(data_cb.split("_")[2])
-                    if idx < len(groups_list):
-                        current_group = groups_list[idx]
-                        send_message(chat_id, f"✅ Switched to: {current_group['name']}")
-                
-                elif data_cb == "leave_vc":
-                    show_leave_groups(chat_id)
-                
-                elif data_cb.startswith("leave_group_"):
-                    gid = int(data_cb.split("_")[2])
-                    gname = None
-                    tcount = 0
-                    for name, d in active_vc.items():
-                        if d["group_id"] == gid:
-                            gname = d["group_name"]
-                            tcount += 1
-                    if gname:
-                        leave_selected_group[user_id] = {"group_id": gid, "group_name": gname, "total": tcount}
-                        send_message(chat_id, f"🎤 Group: {gname}\n👥 Active accounts: {tcount}\n\n📝 **Send number of accounts to leave** (1 to {tcount})")
-                
-                elif data_cb == "cancel_leave":
-                    send_message(chat_id, "❌ Cancelled")
+                elif "message" in update:
+                    msg = update["message"]
+                    user_id = msg["from"]["id"]
+                    chat_id = msg["chat"]["id"]
+                    text = msg.get("text", "")
+                    print(f"\n📨 Message: {text}")
+                    
+                    if user_id != OWNER_ID:
+                        continue
+                    
+                    # Handle leave count input
                     if user_id in leave_selected_group:
-                        del leave_selected_group[user_id]
-                
-                requests.post(f"{API_URL}/answerCallbackQuery", json={"callback_query_id": callback["id"]})
-            
-            elif "message" in update:
-                msg = update["message"]
-                user_id = msg["from"]["id"]
-                chat_id = msg["chat"]["id"]
-                text = msg.get("text", "")
-                print(f"\n📨 Message: {text}")
-                
-                if user_id != OWNER_ID:
-                    continue
-                
-                # Handle leave count input
-                if user_id in leave_selected_group:
-                    try:
-                        count = int(text)
-                        group_info = leave_selected_group[user_id]
-                        if count <= 0:
-                            send_message(chat_id, "❌ Count must be greater than 0!")
-                        elif count > group_info["total"]:
-                            send_message(chat_id, f"❌ Only {group_info['total']} accounts active! Send smaller number.")
-                        else:
-                            send_message(chat_id, f"🚪 Leaving {count} accounts from {group_info['group_name']}...")
-                            loop = asyncio.new_event_loop()
-                            asyncio.set_event_loop(loop)
-                            results = loop.run_until_complete(leave_specific_accounts(group_info["group_id"], count))
-                            loop.close()
-                            scount = sum(1 for r in results if r["success"])
-                            send_message(chat_id, f"✅ Left {scount} accounts from {group_info['group_name']}")
-                            del leave_selected_group[user_id]
-                    except ValueError:
-                        send_message(chat_id, "❌ Please send a valid number!")
-                    continue
-                
-                # Handle phone number input for new session
-                if user_id in user_states and user_states[user_id].get("step") == "waiting_phone":
-                    phone = text.strip()
-                    if phone.startswith("+") and len(phone) > 8:
-                        send_message(chat_id, "⏳ Creating session...")
-                        await create_new_session(phone, chat_id)
-                        del user_states[user_id]
-                    else:
-                        send_message(chat_id, "❌ Invalid phone number! Send with country code.\nExample: +919876543210")
-                    continue
-                
-                # Handle OTP input
-                if chat_id in temp_session_data and temp_session_data[chat_id].get("step") == "waiting_otp":
-                    code = text.strip().replace(" ", "")
-                    if code.isdigit():
-                        await verify_session_otp(chat_id, code)
-                    else:
-                        send_message(chat_id, "❌ Please send only numbers as OTP code!")
-                    continue
-                
-                # Handle 2FA input
-                if chat_id in temp_session_data and temp_session_data[chat_id].get("step") == "waiting_2fa":
-                    await verify_session_2fa(chat_id, text.strip())
-                    continue
-                
-                # Handle existing session string input
-                if user_id in user_states and user_states[user_id].get("step") == "awaiting_session":
-                    if len(text) > 50:
-                        send_message(chat_id, "⏳ Testing session...")
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                        result = loop.run_until_complete(test_session(text))
-                        loop.close()
-                        if result["success"]:
-                            user_sessions.append({
-                                "string": text,
-                                "name": result["name"],
-                                "id": result["id"],
-                                "username": result["username"]
-                            })
-                            # Show connect button for this session
-                            kb = {"inline_keyboard": [
-                                [{"text": "✅ Tap to Connect", "callback_data": f"connect_session_{len(user_sessions)-1}"}]
-                            ]}
-                            send_message(chat_id, f"✅ **Session Added!**\n\n👤 {result['name']}\n🆔 `{result['id']}`\n📊 Total: `{len(user_sessions)}`\n\nTap below to connect this session:", kb)
+                        try:
+                            count = int(text)
+                            group_info = leave_selected_group[user_id]
+                            if count <= 0:
+                                send_message(chat_id, "❌ Count must be greater than 0!")
+                            elif count > group_info["total"]:
+                                send_message(chat_id, f"❌ Only {group_info['total']} accounts active!")
+                            else:
+                                send_message(chat_id, f"🚪 Leaving {count} accounts...")
+                                results = await leave_specific_accounts(group_info["group_id"], count)
+                                scount = sum(1 for r in results if r["success"])
+                                send_message(chat_id, f"✅ Left {scount} accounts from {group_info['group_name']}")
+                                del leave_selected_group[user_id]
+                        except ValueError:
+                            send_message(chat_id, "❌ Please send a valid number!")
+                        continue
+                    
+                    # Handle phone number input
+                    if user_id in user_states and user_states[user_id].get("step") == "waiting_phone":
+                        phone = text.strip()
+                        if phone.startswith("+") and len(phone) > 8:
+                            send_message(chat_id, "⏳ Creating session...")
+                            await create_new_session(phone, chat_id)
                             del user_states[user_id]
                         else:
-                            send_message(chat_id, f"❌ Invalid session: {result['error']}")
-                    else:
-                        send_message(chat_id, "❌ Invalid session string!")
-                    continue
-                
-                # Regular commands
-                if text == "/start":
-                    kb = {"inline_keyboard": [
-                        [{"text": "🔌 Connect Existing Session", "callback_data": "connect_existing"}],
-                        [{"text": "✨ Create New Session", "callback_data": "create_new_session"}],
-                        [{"text": "📊 Status", "callback_data": "status"}],
-                        [{"text": "➕ Add Group", "callback_data": "public_group"}],
-                        [{"text": "📋 Groups", "callback_data": "show_groups"}],
-                        [{"text": "🚪 Leave VC", "callback_data": "leave_vc"}]
-                    ]}
-                    send_message(chat_id, "**🎵 VC Manager Bot**\n\nChoose an option below:", kb)
-                
-                elif text == "/add":
-                    kb = {"inline_keyboard": [
-                        [{"text": "🌐 Public", "callback_data": "public_group"}],
-                        [{"text": "🔒 Private", "callback_data": "private_group"}]
-                    ]}
-                    send_message(chat_id, "Select type:", kb)
-                
-                elif text == "/groups":
-                    if not groups_list:
-                        send_message(chat_id, "No groups added!")
-                    else:
-                        kb = {"inline_keyboard": []}
-                        for i, grp in enumerate(groups_list):
-                            kb["inline_keyboard"].append([{"text": f"📌 {grp['name']}", "callback_data": f"select_group_{i}"}])
-                        send_message(chat_id, "Your Groups:", kb)
-                
-                elif text == "/leavevc":
-                    show_leave_groups(chat_id)
-                
-                elif text.startswith("/joinvc"):
-                    parts = text.split()
-                    if len(parts) != 2:
-                        send_message(chat_id, "Usage: /joinvc <count>")
+                            send_message(chat_id, "❌ Invalid phone number! Example: +919876543210")
                         continue
-                    try:
-                        count = int(parts[1])
-                    except:
-                        send_message(chat_id, "Invalid count!")
-                        continue
-                    if not current_group:
-                        send_message(chat_id, "No group selected! Use /groups")
-                        continue
-                    if len(user_sessions) == 0:
-                        send_message(chat_id, "No sessions added!")
-                        continue
-                    if count > len(user_sessions):
-                        send_message(chat_id, f"Only {len(user_sessions)} sessions available")
-                        continue
-                    send_message(chat_id, f"🎤 Joining {count} accounts to {current_group['name']}...")
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    results = loop.run_until_complete(join_voice_chat(chat_id, current_group["name"], count))
-                    loop.close()
-                    scount = sum(1 for r in results if r["success"])
-                    msg_text = f"✅ Joined: {scount}/{count}\n"
-                    for r in results:
-                        if r["success"]:
-                            msg_text += f"✅ {r['name']}\n"
+                    
+                    # Handle OTP input
+                    if chat_id in temp_session_data and temp_session_data[chat_id].get("step") == "waiting_otp":
+                        code = text.strip().replace(" ", "")
+                        if code.isdigit():
+                            await verify_session_otp(chat_id, code)
                         else:
-                            msg_text += f"❌ {r['name']}: {r['error']}\n"
-                    send_message(chat_id, msg_text)
-                
-                elif text == "/status":
-                    status_text = f"**📊 Status**\nSessions: {len(user_sessions)}\nActive VC: {len(active_vc)}\nGroups: {len(groups_list)}"
-                    if current_group:
-                        status_text += f"\nCurrent: {current_group['name']}"
-                    send_message(chat_id, status_text)
-                
-                elif text == "/done":
-                    send_message(chat_id, f"✅ Done! Total sessions: {len(user_sessions)}")
-                    if user_id in user_states:
+                            send_message(chat_id, "❌ Please send only numbers!")
+                        continue
+                    
+                    # Handle 2FA input
+                    if chat_id in temp_session_data and temp_session_data[chat_id].get("step") == "waiting_2fa":
+                        await verify_session_2fa(chat_id, text.strip())
+                        continue
+                    
+                    # Handle existing session string
+                    if user_id in user_states and user_states[user_id].get("step") == "awaiting_session":
+                        if len(text) > 50:
+                            send_message(chat_id, "⏳ Testing session...")
+                            result = await test_session(text)
+                            if result["success"]:
+                                user_sessions.append({
+                                    "string": text,
+                                    "name": result["name"],
+                                    "id": result["id"],
+                                    "username": result["username"]
+                                })
+                                kb = {"inline_keyboard": [
+                                    [{"text": "✅ Tap to Connect", "callback_data": f"connect_session_{len(user_sessions)-1}"}]
+                                ]}
+                                send_message(chat_id, f"✅ **Session Added!**\n\n👤 {result['name']}\n🆔 `{result['id']}`\n📊 Total: `{len(user_sessions)}`\n\nTap below to connect:", kb)
+                                del user_states[user_id]
+                            else:
+                                send_message(chat_id, f"❌ Invalid session: {result['error']}")
+                        else:
+                            send_message(chat_id, "❌ Invalid session string!")
+                        continue
+                    
+                    # Regular commands
+                    if text == "/start":
+                        kb = {"inline_keyboard": [
+                            [{"text": "🔌 Connect Existing Session", "callback_data": "connect_existing"}],
+                            [{"text": "✨ Create New Session", "callback_data": "create_new_session"}],
+                            [{"text": "📊 Status", "callback_data": "status"}],
+                            [{"text": "➕ Add Group", "callback_data": "public_group"}],
+                            [{"text": "📋 Groups", "callback_data": "show_groups"}],
+                            [{"text": "🚪 Leave VC", "callback_data": "leave_vc"}]
+                        ]}
+                        send_message(chat_id, "**🎵 VC Manager Bot**\n\nChoose an option below:", kb)
+                    
+                    elif text == "/add":
+                        kb = {"inline_keyboard": [
+                            [{"text": "🌐 Public", "callback_data": "public_group"}],
+                            [{"text": "🔒 Private", "callback_data": "private_group"}]
+                        ]}
+                        send_message(chat_id, "Select type:", kb)
+                    
+                    elif text == "/groups":
+                        if not groups_list:
+                            send_message(chat_id, "No groups added!")
+                        else:
+                            kb = {"inline_keyboard": []}
+                            for i, grp in enumerate(groups_list):
+                                kb["inline_keyboard"].append([{"text": f"📌 {grp['name']}", "callback_data": f"select_group_{i}"}])
+                            send_message(chat_id, "Your Groups:", kb)
+                    
+                    elif text == "/leavevc":
+                        show_leave_groups(chat_id)
+                    
+                    elif text.startswith("/joinvc"):
+                        parts = text.split()
+                        if len(parts) != 2:
+                            send_message(chat_id, "Usage: /joinvc <count>")
+                            continue
+                        try:
+                            count = int(parts[1])
+                        except:
+                            send_message(chat_id, "Invalid count!")
+                            continue
+                        if not current_group:
+                            send_message(chat_id, "No group selected! Use /groups")
+                            continue
+                        if len(user_sessions) == 0:
+                            send_message(chat_id, "No sessions added!")
+                            continue
+                        if count > len(user_sessions):
+                            send_message(chat_id, f"Only {len(user_sessions)} sessions available")
+                            continue
+                        send_message(chat_id, f"🎤 Joining {count} accounts to {current_group['name']}...")
+                        results = await join_voice_chat(chat_id, current_group["name"], count)
+                        scount = sum(1 for r in results if r["success"])
+                        msg_text = f"✅ Joined: {scount}/{count}\n"
+                        for r in results:
+                            if r["success"]:
+                                msg_text += f"✅ {r['name']}\n"
+                            else:
+                                msg_text += f"❌ {r['name']}: {r['error']}\n"
+                        send_message(chat_id, msg_text)
+                    
+                    elif text == "/status":
+                        status_text = f"**📊 Status**\nSessions: {len(user_sessions)}\nActive VC: {len(active_vc)}\nGroups: {len(groups_list)}"
+                        if current_group:
+                            status_text += f"\nCurrent: {current_group['name']}"
+                        send_message(chat_id, status_text)
+                    
+                    elif text == "/done":
+                        send_message(chat_id, f"✅ Done! Total sessions: {len(user_sessions)}")
+                        if user_id in user_states:
+                            del user_states[user_id]
+                    
+                    elif user_id in user_states and user_states[user_id].get("step") == "public_username":
+                        username = text.replace("@", "")
+                        try:
+                            resp = requests.get(f"{API_URL}/getChat", params={"chat_id": f"@{username}"}, timeout=10)
+                            if resp.ok:
+                                ci = resp.json()["result"]
+                                gtitle = ci.get("title", username)
+                                gcid = ci["id"]
+                                groups_list.append({"name": gtitle, "chat_id": gcid, "username": username})
+                                current_group = groups_list[-1]
+                                send_message(chat_id, f"✅ Added: {gtitle}\nUse /joinvc")
+                            else:
+                                send_message(chat_id, f"❌ Could not resolve @{username}")
+                        except Exception as e:
+                            send_message(chat_id, f"❌ Error: {e}")
                         del user_states[user_id]
-                
-                elif user_id in user_states and user_states[user_id].get("step") == "public_username":
-                    username = text.replace("@", "")
-                    try:
-                        resp = requests.get(f"{API_URL}/getChat", params={"chat_id": f"@{username}"}, timeout=10)
-                        if resp.ok:
-                            ci = resp.json()["result"]
-                            gtitle = ci.get("title", username)
-                            gcid = ci["id"]
-                            groups_list.append({"name": gtitle, "chat_id": gcid, "username": username})
+                    
+                    elif user_id in user_states and user_states[user_id].get("step") == "private_link":
+                        user_states[user_id] = {"step": "private_chatid", "link": text}
+                        send_message(chat_id, "Send Chat ID")
+                    
+                    elif user_id in user_states and user_states[user_id].get("step") == "private_chatid":
+                        try:
+                            cid = int(text)
+                            groups_list.append({"name": f"Private_{cid}", "chat_id": cid, "invite_link": user_states[user_id]["link"]})
                             current_group = groups_list[-1]
-                            send_message(chat_id, f"✅ Added: {gtitle}\nUse /joinvc")
-                        else:
-                            send_message(chat_id, f"❌ Could not resolve @{username}")
-                    except Exception as e:
-                        send_message(chat_id, f"❌ Error: {e}")
-                    del user_states[user_id]
-                
-                elif user_id in user_states and user_states[user_id].get("step") == "private_link":
-                    user_states[user_id] = {"step": "private_chatid", "link": text}
-                    send_message(chat_id, "Send Chat ID")
-                
-                elif user_id in user_states and user_states[user_id].get("step") == "private_chatid":
-                    try:
-                        cid = int(text)
-                        groups_list.append({"name": f"Private_{cid}", "chat_id": cid, "invite_link": user_states[user_id]["link"]})
-                        current_group = groups_list[-1]
-                        send_message(chat_id, f"✅ Added Private Group\nUse /joinvc")
-                        del user_states[user_id]
-                    except:
-                        send_message(chat_id, "Invalid Chat ID!")
+                            send_message(chat_id, f"✅ Added Private Group\nUse /joinvc")
+                            del user_states[user_id]
+                        except:
+                            send_message(chat_id, "Invalid Chat ID!")
         
-        time.sleep(1)
-    except KeyboardInterrupt:
-        print("\nBot stopped")
-        break
-    except Exception as e:
-        print(f"Error: {e}")
-        time.sleep(5)
+        except Exception as e:
+            print(f"Error: {e}")
+            time.sleep(5)
+
+if __name__ == "__main__":
+    asyncio.run(main())
