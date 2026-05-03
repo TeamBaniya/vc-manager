@@ -80,13 +80,21 @@ async def leave_specific_accounts(group_id, count):
     for name, data in active_vc.items():
         if data["group_id"] == group_id:
             accounts_to_leave.append(name)
+    
+    if not accounts_to_leave:
+        return results
+    
     for name in accounts_to_leave[:count]:
         try:
-            await active_vc[name]["vc"].stop()
+            # Use leave() method instead of stop()
+            await active_vc[name]["vc"].leave()
             results.append({"success": True, "name": name})
             print(f"  ✅ {name} left")
         except Exception as e:
-            results.append({"success": False, "name": name, "error": str(e)[:30]})
+            results.append({"success": False, "name": name, "error": str(e)[:50]})
+            print(f"  ❌ {name} failed to leave: {e}")
+        
+        # Remove from active_vc
         if name in active_vc:
             del active_vc[name]
         await asyncio.sleep(1)
@@ -198,7 +206,10 @@ while True:
                             results = loop.run_until_complete(leave_specific_accounts(group_info["group_id"], count))
                             loop.close()
                             scount = sum(1 for r in results if r["success"])
-                            send_message(chat_id, f"✅ Left {scount} accounts from {group_info['group_name']}")
+                            if scount > 0:
+                                send_message(chat_id, f"✅ Left {scount} accounts from {group_info['group_name']}")
+                            else:
+                                send_message(chat_id, f"❌ Failed to leave accounts!")
                             del leave_selected_group[user_id]
                     except ValueError:
                         send_message(chat_id, "❌ Please send a valid number!")
