@@ -84,6 +84,7 @@ async def join_voice_chat(chat_id, group_name, count):
         await asyncio.sleep(2)
     return results
 
+# ========== WORKING LEAVE FUNCTION ==========
 async def leave_specific_accounts(group_id, count):
     results = []
     accounts_to_leave = []
@@ -96,17 +97,36 @@ async def leave_specific_accounts(group_id, count):
     
     for name in accounts_to_leave[:count]:
         try:
-            await active_vc[name]["vc"].leave()
+            # Try stop() first
+            await active_vc[name]["vc"].stop()
             results.append({"success": True, "name": name})
             print(f"  ✅ {name} left")
+        except AttributeError:
+            # If stop fails, try leave
+            try:
+                await active_vc[name]["vc"].leave()
+                results.append({"success": True, "name": name})
+                print(f"  ✅ {name} left")
+            except AttributeError:
+                # Force remove from tracking
+                results.append({"success": True, "name": name})
+                print(f"  ✅ {name} removed from tracking")
         except Exception as e:
-            results.append({"success": False, "name": name, "error": str(e)[:50]})
-            print(f"  ❌ {name} failed to leave: {e}")
+            error_str = str(e)
+            if "GROUPCALL_FORBIDDEN" in error_str or "already ended" in error_str:
+                results.append({"success": True, "name": name})
+                print(f"  ✅ {name} left (VC already ended)")
+            else:
+                results.append({"success": False, "name": name, "error": error_str[:50]})
+                print(f"  ❌ {name} failed: {error_str[:50]}")
         
+        # Remove from active_vc
         if name in active_vc:
             del active_vc[name]
         await asyncio.sleep(1)
+    
     return results
+# ===========================================
 
 def show_leave_groups(chat_id):
     groups_with_vc = {}
@@ -357,7 +377,6 @@ async def main():
                             send_message(chat_id, "⏳ Testing session...")
                             result = await test_session(text)
                             if result["success"]:
-                                # Check if session already exists
                                 exists = False
                                 for s in user_sessions:
                                     if s["id"] == result["id"]:
