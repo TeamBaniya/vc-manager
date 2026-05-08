@@ -14,7 +14,7 @@ TOKEN = BOT_TOKEN
 API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
 # Get image URL from environment variable
-IMAGE_URL = os.environ.get("IMAGE_URL", "https://telegra.ph/file/default-image.jpg")
+IMAGE_URL = os.environ.get("IMAGE_URL", "https://files.catbox.moe/pv9i5b.jpg")
 
 # Data storage
 user_sessions = []
