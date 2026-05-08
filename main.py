@@ -786,4 +786,102 @@ Welcome to VC Manager Bot! I can help you manage multiple accounts in voice chat
                         if len(user_sessions) == 0:
                             send_message(chat_id, "No sessions added! Use /start to add sessions")
                             continue
-                        if count > len(user_s
+                        if count > len(user_sessions):
+                            send_message(chat_id, f"Only {len(user_sessions)} sessions available!")
+                            continue
+                        
+                        send_message(chat_id, f"🎤 Joining {count} accounts to {current_group['name']}...")
+                        results = await join_voice_chat(current_group["chat_id"], current_group["name"], count)
+                        
+                        scount = sum(1 for r in results if r["success"])
+                        msg_text = f"**✅ Joined: {scount}/{count}**\n\n"
+                        for r in results:
+                            if r["success"]:
+                                msg_text += f"✅ {r['name']}\n"
+                            else:
+                                msg_text += f"❌ {r['name']}: {r['error']}\n"
+                        send_message(chat_id, msg_text)
+                    
+                    elif text == "/status":
+                        status_text = f"**📊 Status**\n\n"
+                        status_text += f"📱 Sessions: {len(user_sessions)}\n"
+                        status_text += f"🔌 Connected: {len(user_clients)}\n"
+                        status_text += f"🎤 Active VC: {len(active_vc)}\n"
+                        status_text += f"📋 Groups: {len(groups_list)}\n"
+                        status_text += f"👑 Sudo Users: {len(sudo_users)}\n"
+                        if current_group:
+                            status_text += f"\n📍 Current: {current_group['name']}"
+                        send_message(chat_id, status_text)
+                    
+                    elif text == "/done":
+                        send_message(chat_id, f"✅ Done! Total sessions: {len(user_sessions)}")
+                        if user_id in user_states:
+                            del user_states[user_id]
+                    
+                    # Handle session string input
+                    elif user_id in user_states and user_states[user_id].get("step") == "awaiting_session":
+                        if len(text) > 50:
+                            send_message(chat_id, "⏳ Testing session...")
+                            result = await test_session(text)
+                            if result["success"]:
+                                exists = False
+                                for s in user_sessions:
+                                    if s["id"] == result["id"]:
+                                        exists = True
+                                        break
+                                if exists:
+                                    send_message(chat_id, f"⚠️ Session for {result['name']} already exists!")
+                                else:
+                                    user_sessions.append({
+                                        "string": text,
+                                        "name": result["name"],
+                                        "id": result["id"],
+                                        "username": result["username"]
+                                    })
+                                    send_message(chat_id, f"✅ **Session Added!**\n\n👤 {result['name']}\n🆔 `{result['id']}`\n📊 Total: {len(user_sessions)}\n\nSend more or type /done")
+                            else:
+                                send_message(chat_id, f"❌ Invalid session: {result['error']}")
+                        else:
+                            send_message(chat_id, "❌ Invalid session string!")
+                    
+                    # Handle public group username
+                    elif user_id in user_states and user_states[user_id].get("step") == "public_username":
+                        username = text.replace("@", "")
+                        send_message(chat_id, f"⏳ Resolving @{username}...")
+                        try:
+                            resp = requests.get(f"{API_URL}/getChat", params={"chat_id": f"@{username}"}, timeout=10)
+                            if resp.ok:
+                                ci = resp.json()["result"]
+                                gtitle = ci.get("title", username)
+                                gcid = ci["id"]
+                                groups_list.append({"name": gtitle, "chat_id": gcid, "username": username})
+                                current_group = groups_list[-1]
+                                send_message(chat_id, f"✅ **Group Added!**\n\n📌 {gtitle}\n🆔 `{gcid}`\n\nUse /joinvc <count> to join voice chat")
+                            else:
+                                send_message(chat_id, f"❌ Could not resolve @{username}\n\nMake sure the username is correct and accounts are added to the group.")
+                        except Exception as e:
+                            send_message(chat_id, f"❌ Error: {e}")
+                        del user_states[user_id]
+                    
+                    # Handle private group link
+                    elif user_id in user_states and user_states[user_id].get("step") == "private_link":
+                        user_states[user_id] = {"step": "private_chatid", "link": text}
+                        send_message(chat_id, "Send Chat ID (example: -1001234567890)")
+                    
+                    # Handle private group chat_id
+                    elif user_id in user_states and user_states[user_id].get("step") == "private_chatid":
+                        try:
+                            cid = int(text)
+                            groups_list.append({"name": f"Private_{cid}", "chat_id": cid, "invite_link": user_states[user_id]["link"]})
+                            current_group = groups_list[-1]
+                            send_message(chat_id, f"✅ **Private Group Added!**\n\n🆔 `{cid}`\n\nUse /joinvc <count> to join voice chat")
+                            del user_states[user_id]
+                        except:
+                            send_message(chat_id, "Invalid Chat ID!")
+        
+        except Exception as e:
+            print(f"Error: {e}")
+            time.sleep(5)
+
+if __name__ == "__main__":
+    asyncio.run(main())
