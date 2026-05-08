@@ -6,6 +6,7 @@ import os
 import re
 from datetime import datetime, timedelta
 from pyrogram import Client
+from pyrogram.errors import PhoneNumberInvalid, SessionPasswordNeeded, PhoneCodeInvalid
 from pytgcalls import GroupCallFactory
 from database import db
 from config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID
@@ -13,7 +14,7 @@ from config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID
 TOKEN = BOT_TOKEN
 API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
-# Get image URL from environment variable
+# Get image URL from environment variable (optional)
 IMAGE_URL = os.environ.get("IMAGE_URL", "https://files.catbox.moe/pv9i5b.jpg")
 
 # Data storage
@@ -25,6 +26,9 @@ current_group = None
 last_update_id = 0
 user_states = {}
 leave_selected_group = {}
+
+# Login states storage
+login_states = {}  # {user_id: {"step": "awaiting_number", "client": client, "phone": phone}}
 
 # Sudo users storage
 sudo_users = {}  # {user_id: {"expiry": datetime, "username": username, "approved_by": owner_id}}
@@ -40,17 +44,24 @@ def send_message(chat_id, text, reply_markup=None):
     if reply_markup:
         data["reply_markup"] = json.dumps(reply_markup)
     try:
-        requests.post(f"{API_URL}/sendMessage", json=data, timeout=5)
-    except:
-        pass
+        response = requests.post(f"{API_URL}/sendMessage", json=data, timeout=5)
+        print(f"Send message response: {response.status_code}")
+    except Exception as e:
+        print(f"Error sending message: {e}")
 
 def send_photo(chat_id, photo_url, caption, reply_markup=None):
+    if not photo_url:
+        # If no image URL, just send as normal message
+        send_message(chat_id, caption, reply_markup)
+        return
+    
     data = {"chat_id": chat_id, "photo": photo_url, "caption": caption, "parse_mode": "Markdown"}
     if reply_markup:
         data["reply_markup"] = json.dumps(reply_markup)
     try:
         requests.post(f"{API_URL}/sendPhoto", json=data, timeout=5)
-    except:
+    except Exception as e:
+        print(f"Error sending photo: {e}")
         # Fallback to send message if photo fails
         send_message(chat_id, caption, reply_markup)
 
@@ -94,6 +105,114 @@ def parse_time_duration(duration_str):
         return timedelta(days=value * 365)
     
     return None
+
+async def login_with_phone(phone_number, user_id):
+    """Handle phone login and OTP"""
+    try:
+        # Create temporary client
+        client = Client(f"temp_{user_id}", api_id=API_ID, api_hash=API_HASH, in_memory=True)
+        await client.connect()
+        
+        # Send code
+        sent_code = await client.send_code(phone_number)
+        
+        # Store client and phone info
+        login_states[user_id] = {
+            "step": "awaiting_otp",
+            "client": client,
+            "phone": phone_number,
+            "phone_code_hash": sent_code.phone_code_hash
+        }
+        
+        return {"success": True, "message": "OTP sent successfully!"}
+    except PhoneNumberInvalid:
+        return {"success": False, "error": "Invalid phone number! Please include country code (e.g., +91XXXXXXXXXX)"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+async def verify_otp(user_id, otp_code):
+    """Verify OTP and get session string"""
+    try:
+        if user_id not in login_states:
+            return {"success": False, "error": "No login session found! Please start over."}
+        
+        login_data = login_states[user_id]
+        client = login_data["client"]
+        phone = login_data["phone"]
+        phone_code_hash = login_data["phone_code_hash"]
+        
+        try:
+            # Sign in with OTP
+            await client.sign_in(phone, phone_code_hash, otp_code)
+            
+            # Get session string
+            session_string = await client.export_session_string()
+            
+            # Get user info
+            me = await client.get_me()
+            
+            # Disconnect client
+            await client.disconnect()
+            
+            # Clean up
+            del login_states[user_id]
+            
+            # Return session data
+            return {
+                "success": True,
+                "session_string": session_string,
+                "name": me.first_name,
+                "id": me.id,
+                "username": me.username
+            }
+        except SessionPasswordNeeded:
+            login_states[user_id]["step"] = "awaiting_password"
+            return {"success": False, "error": "2FA", "message": "Two-factor authentication enabled! Please send your password."}
+        except PhoneCodeInvalid:
+            return {"success": False, "error": "Invalid OTP! Please try again."}
+            
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+async def verify_2fa_password(user_id, password):
+    """Verify 2FA password"""
+    try:
+        if user_id not in login_states:
+            return {"success": False, "error": "No login session found!"}
+        
+        login_data = login_states[user_id]
+        client = login_data["client"]
+        phone = login_data["phone"]
+        
+        try:
+            # Check password
+            await client.check_password(password)
+            
+            # Get session string
+            session_string = await client.export_session_string()
+            
+            # Get user info
+            me = await client.get_me()
+            
+            # Disconnect client
+            await client.disconnect()
+            
+            # Clean up
+            del login_states[user_id]
+            
+            # Return session data
+            return {
+                "success": True,
+                "session_string": session_string,
+                "name": me.first_name,
+                "id": me.id,
+                "username": me.username
+            }
+        except Exception as e:
+            return {"success": False, "error": f"Invalid password! {str(e)}"}
+            
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 async def test_session(session_string):
     try:
@@ -263,9 +382,13 @@ async def main():
                         requests.post(f"{API_URL}/answerCallbackQuery", json={"callback_query_id": callback["id"]})
                         continue
                     
-                    if data_cb == "connect":
+                    if data_cb == "login":
+                        user_states[user_id] = {"step": "awaiting_phone"}
+                        send_message(chat_id, "📱 **Login with Phone Number**\n\nPlease send your phone number with country code.\nExample: `+91XXXXXXXXXX`\n\nType `/cancel` to cancel.")
+                    
+                    elif data_cb == "connect":
                         user_states[user_id] = {"step": "awaiting_session"}
-                        send_message(chat_id, "📱 **Send Pyrogram String Session**\n\nGet from @StringSessionBot\nType `/done` when finished")
+                        send_message(chat_id, "📱 **Send Pyrogram String Session**\n\nGet from @StringSessionBot\nType `/done` when finished\nType `/cancel` to cancel")
                     
                     elif data_cb == "status":
                         status_text = f"**📊 Status**\n\n"
@@ -336,6 +459,34 @@ async def main():
                     elif data_cb == "show_sudo":
                         show_sudo_users(chat_id)
                     
+                    elif data_cb == "developer":
+                        dev_text = "**👨‍💻 Developer Info**\n\n"
+                        dev_text += "**Name:** Your Name\n"
+                        dev_text += "**Telegram:** @yourusername\n"
+                        dev_text += "**GitHub:** github.com/yourusername\n\n"
+                        dev_text += "**Bot Version:** 2.0\n"
+                        dev_text += "**Library:** Pyrogram + PyTgCalls"
+                        send_message(chat_id, dev_text)
+                    
+                    elif data_cb == "help_commands":
+                        help_text = "**📚 Help & Commands**\n\n"
+                        help_text += "**Main Commands:**\n"
+                        help_text += "/start - Start the bot\n"
+                        help_text += "/add - Add a group\n"
+                        help_text += "/joinvc <count> - Join voice chat\n"
+                        help_text += "/leavevc - Leave voice chat\n"
+                        help_text += "/groups - List all groups\n"
+                        help_text += "/sessions - List all sessions\n"
+                        help_text += "/status - Bot status\n"
+                        help_text += "/done - Finish adding sessions\n"
+                        help_text += "/cancel - Cancel current operation\n\n"
+                        help_text += "**How to use:**\n"
+                        help_text += "1. First add your account via Login or Session\n"
+                        help_text += "2. Add a group where you want to join\n"
+                        help_text += "3. Use /joinvc <count> to join voice chat\n"
+                        help_text += "4. Use /leavevc to leave voice chat"
+                        send_message(chat_id, help_text)
+                    
                     requests.post(f"{API_URL}/answerCallbackQuery", json={"callback_query_id": callback["id"]})
                 
                 elif "message" in update:
@@ -345,6 +496,20 @@ async def main():
                     text = msg.get("text", "")
                     username = msg["from"].get("username", "NoUsername")
                     print(f"\n📨 Message from {username} ({user_id}): {text}")
+                    
+                    # Handle cancel command
+                    if text == "/cancel":
+                        if user_id in user_states:
+                            del user_states[user_id]
+                        if user_id in login_states:
+                            if "client" in login_states[user_id]:
+                                try:
+                                    await login_states[user_id]["client"].disconnect()
+                                except:
+                                    pass
+                            del login_states[user_id]
+                        send_message(chat_id, "✅ Operation cancelled!")
+                        continue
                     
                     # Handle approval requests from non-sudo users
                     if user_id != OWNER_ID and not is_sudo_user(user_id):
@@ -446,6 +611,93 @@ async def main():
                         show_sudo_users(chat_id)
                         continue
                     
+                    # Handle phone number input for login
+                    if user_id in user_states and user_states[user_id].get("step") == "awaiting_phone":
+                        phone_number = text.strip()
+                        if not phone_number.startswith("+"):
+                            send_message(chat_id, "❌ Please include country code!\nExample: `+91XXXXXXXXXX`\n\nSend phone number again or type `/cancel`")
+                            continue
+                        
+                        send_message(chat_id, "⏳ Sending OTP...")
+                        result = await login_with_phone(phone_number, user_id)
+                        
+                        if result["success"]:
+                            send_message(chat_id, f"✅ {result['message']}\n\n📱 OTP sent to {phone_number}\nPlease send the OTP code you received.\n\nType `/cancel` to cancel")
+                            user_states[user_id] = {"step": "awaiting_otp"}
+                        else:
+                            send_message(chat_id, f"❌ {result['error']}\n\nPlease try again or type `/cancel`")
+                            del user_states[user_id]
+                        continue
+                    
+                    # Handle OTP input
+                    if user_id in user_states and user_states[user_id].get("step") == "awaiting_otp":
+                        otp = text.strip()
+                        if not otp.isdigit():
+                            send_message(chat_id, "❌ Invalid OTP! Please send the numeric code you received.\nType `/cancel` to cancel")
+                            continue
+                        
+                        send_message(chat_id, "⏳ Verifying OTP...")
+                        result = await verify_otp(user_id, otp)
+                        
+                        if result["success"]:
+                            # Check if session already exists
+                            exists = False
+                            for s in user_sessions:
+                                if s["id"] == result["id"]:
+                                    exists = True
+                                    break
+                            
+                            if exists:
+                                send_message(chat_id, f"⚠️ Session for {result['name']} already exists!")
+                            else:
+                                user_sessions.append({
+                                    "string": result["session_string"],
+                                    "name": result["name"],
+                                    "id": result["id"],
+                                    "username": result["username"]
+                                })
+                                send_message(chat_id, f"✅ **Account Added Successfully!**\n\n👤 Name: {result['name']}\n🆔 ID: `{result['id']}`\n📊 Total Sessions: {len(user_sessions)}\n\nYou can add more accounts or use the bot!")
+                            
+                            del user_states[user_id]
+                        elif result.get("error") == "2FA":
+                            send_message(chat_id, f"🔐 {result.get('message', '2FA required!')}\nPlease send your 2FA password.\nType `/cancel` to cancel")
+                            user_states[user_id] = {"step": "awaiting_2fa"}
+                        else:
+                            send_message(chat_id, f"❌ {result['error']}\n\nPlease try again or type `/cancel`")
+                            del user_states[user_id]
+                        continue
+                    
+                    # Handle 2FA password input
+                    if user_id in user_states and user_states[user_id].get("step") == "awaiting_2fa":
+                        password = text.strip()
+                        send_message(chat_id, "⏳ Verifying 2FA...")
+                        result = await verify_2fa_password(user_id, password)
+                        
+                        if result["success"]:
+                            # Check if session already exists
+                            exists = False
+                            for s in user_sessions:
+                                if s["id"] == result["id"]:
+                                    exists = True
+                                    break
+                            
+                            if exists:
+                                send_message(chat_id, f"⚠️ Session for {result['name']} already exists!")
+                            else:
+                                user_sessions.append({
+                                    "string": result["session_string"],
+                                    "name": result["name"],
+                                    "id": result["id"],
+                                    "username": result["username"]
+                                })
+                                send_message(chat_id, f"✅ **Account Added Successfully!**\n\n👤 Name: {result['name']}\n🆔 ID: `{result['id']}`\n📊 Total Sessions: {len(user_sessions)}\n\nYou can add more accounts or use the bot!")
+                            
+                            del user_states[user_id]
+                        else:
+                            send_message(chat_id, f"❌ {result['error']}\n\nPlease try again or type `/cancel`")
+                            del user_states[user_id]
+                        continue
+                    
                     # Handle leave count input
                     if user_id in leave_selected_group:
                         try:
@@ -470,38 +722,31 @@ async def main():
                     
                     # Regular commands for sudo users
                     if text == "/start":
-                        # Caption for the image
+                        # Caption for the image/message
                         caption = """**🎵 VC Manager Bot** 
 
 Welcome to VC Manager Bot! I can help you manage multiple accounts in voice chats.
 
-**Commands:**
-/add - Add group
-/joinvc <count> - Join VC
-/leavevc - Smart leave
-/groups - All groups
-/sessions - All sessions
-/status - Status
-/done - Done
-
-**Sudo Commands (Owner only):**
-/approve <user_id> <duration> - Approve user
-/removesudo <user_id> - Remove sudo user
-/listsudo - List all sudo users"""
+**Choose an option below to get started:**"""
                         
-                        # Keyboard with 2 buttons per row
+                        # Keyboard with all buttons (2 per row)
                         kb = {"inline_keyboard": [
-                            [{"text": "🔌 Connect Session", "callback_data": "connect"}, {"text": "📊 Status", "callback_data": "status"}],
-                            [{"text": "📱 My Sessions", "callback_data": "show_sessions"}, {"text": "➕ Add Group", "callback_data": "public_group"}],
-                            [{"text": "📋 Groups", "callback_data": "show_groups"}, {"text": "🚪 Leave VC", "callback_data": "leave_vc"}]
+                            [{"text": "🔐 Login with Phone", "callback_data": "login"}, {"text": "🔌 Connect Session", "callback_data": "connect"}],
+                            [{"text": "📊 Status", "callback_data": "status"}, {"text": "📱 My Sessions", "callback_data": "show_sessions"}],
+                            [{"text": "➕ Add Group", "callback_data": "public_group"}, {"text": "📋 Groups", "callback_data": "show_groups"}],
+                            [{"text": "🚪 Leave VC", "callback_data": "leave_vc"}, {"text": "👨‍💻 Developer", "callback_data": "developer"}],
+                            [{"text": "❓ Help & Commands", "callback_data": "help_commands"}]
                         ]}
                         
                         # Add sudo button for owner
                         if user_id == OWNER_ID:
                             kb["inline_keyboard"].append([{"text": "👑 Manage Sudo Users", "callback_data": "show_sudo"}])
                         
-                        # Send image with caption and buttons
-                        send_photo(chat_id, IMAGE_URL, caption, kb)
+                        # Send image if URL provided, otherwise send as normal message
+                        if IMAGE_URL:
+                            send_photo(chat_id, IMAGE_URL, caption, kb)
+                        else:
+                            send_message(chat_id, caption, kb)
                     
                     elif text == "/add":
                         kb = {"inline_keyboard": [
@@ -541,102 +786,4 @@ Welcome to VC Manager Bot! I can help you manage multiple accounts in voice chat
                         if len(user_sessions) == 0:
                             send_message(chat_id, "No sessions added! Use /start to add sessions")
                             continue
-                        if count > len(user_sessions):
-                            send_message(chat_id, f"Only {len(user_sessions)} sessions available!")
-                            continue
-                        
-                        send_message(chat_id, f"🎤 Joining {count} accounts to {current_group['name']}...")
-                        results = await join_voice_chat(current_group["chat_id"], current_group["name"], count)
-                        
-                        scount = sum(1 for r in results if r["success"])
-                        msg_text = f"**✅ Joined: {scount}/{count}**\n\n"
-                        for r in results:
-                            if r["success"]:
-                                msg_text += f"✅ {r['name']}\n"
-                            else:
-                                msg_text += f"❌ {r['name']}: {r['error']}\n"
-                        send_message(chat_id, msg_text)
-                    
-                    elif text == "/status":
-                        status_text = f"**📊 Status**\n\n"
-                        status_text += f"📱 Sessions: {len(user_sessions)}\n"
-                        status_text += f"🔌 Connected: {len(user_clients)}\n"
-                        status_text += f"🎤 Active VC: {len(active_vc)}\n"
-                        status_text += f"📋 Groups: {len(groups_list)}\n"
-                        status_text += f"👑 Sudo Users: {len(sudo_users)}\n"
-                        if current_group:
-                            status_text += f"\n📍 Current: {current_group['name']}"
-                        send_message(chat_id, status_text)
-                    
-                    elif text == "/done":
-                        send_message(chat_id, f"✅ Done! Total sessions: {len(user_sessions)}")
-                        if user_id in user_states:
-                            del user_states[user_id]
-                    
-                    # Handle session string input
-                    elif user_id in user_states and user_states[user_id].get("step") == "awaiting_session":
-                        if len(text) > 50:
-                            send_message(chat_id, "⏳ Testing session...")
-                            result = await test_session(text)
-                            if result["success"]:
-                                exists = False
-                                for s in user_sessions:
-                                    if s["id"] == result["id"]:
-                                        exists = True
-                                        break
-                                if exists:
-                                    send_message(chat_id, f"⚠️ Session for {result['name']} already exists!")
-                                else:
-                                    user_sessions.append({
-                                        "string": text,
-                                        "name": result["name"],
-                                        "id": result["id"],
-                                        "username": result["username"]
-                                    })
-                                    send_message(chat_id, f"✅ **Session Added!**\n\n👤 {result['name']}\n🆔 `{result['id']}`\n📊 Total: {len(user_sessions)}\n\nSend more or type /done")
-                            else:
-                                send_message(chat_id, f"❌ Invalid session: {result['error']}")
-                        else:
-                            send_message(chat_id, "❌ Invalid session string!")
-                    
-                    # Handle public group username
-                    elif user_id in user_states and user_states[user_id].get("step") == "public_username":
-                        username = text.replace("@", "")
-                        send_message(chat_id, f"⏳ Resolving @{username}...")
-                        try:
-                            resp = requests.get(f"{API_URL}/getChat", params={"chat_id": f"@{username}"}, timeout=10)
-                            if resp.ok:
-                                ci = resp.json()["result"]
-                                gtitle = ci.get("title", username)
-                                gcid = ci["id"]
-                                groups_list.append({"name": gtitle, "chat_id": gcid, "username": username})
-                                current_group = groups_list[-1]
-                                send_message(chat_id, f"✅ **Group Added!**\n\n📌 {gtitle}\n🆔 `{gcid}`\n\nUse /joinvc <count> to join voice chat")
-                            else:
-                                send_message(chat_id, f"❌ Could not resolve @{username}\n\nMake sure the username is correct and accounts are added to the group.")
-                        except Exception as e:
-                            send_message(chat_id, f"❌ Error: {e}")
-                        del user_states[user_id]
-                    
-                    # Handle private group link
-                    elif user_id in user_states and user_states[user_id].get("step") == "private_link":
-                        user_states[user_id] = {"step": "private_chatid", "link": text}
-                        send_message(chat_id, "Send Chat ID (example: -1001234567890)")
-                    
-                    # Handle private group chat_id
-                    elif user_id in user_states and user_states[user_id].get("step") == "private_chatid":
-                        try:
-                            cid = int(text)
-                            groups_list.append({"name": f"Private_{cid}", "chat_id": cid, "invite_link": user_states[user_id]["link"]})
-                            current_group = groups_list[-1]
-                            send_message(chat_id, f"✅ **Private Group Added!**\n\n🆔 `{cid}`\n\nUse /joinvc <count> to join voice chat")
-                            del user_states[user_id]
-                        except:
-                            send_message(chat_id, "Invalid Chat ID!")
-        
-        except Exception as e:
-            print(f"Error: {e}")
-            time.sleep(5)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+                        if count > len(user_s
