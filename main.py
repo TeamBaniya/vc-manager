@@ -3,6 +3,8 @@ import time
 import json
 import asyncio
 import os
+import re
+from datetime import datetime, timedelta
 from pyrogram import Client
 from pytgcalls import GroupCallFactory
 from database import db
@@ -23,6 +25,10 @@ current_group = None
 last_update_id = 0
 user_states = {}
 leave_selected_group = {}
+
+# Sudo users storage
+sudo_users = {}  # {user_id: {"expiry": datetime, "username": username, "approved_by": owner_id}}
+pending_approvals = {}  # {user_id: {"request_time": datetime, "username": username}}
 
 print("="*60)
 print("🤖 VC MANAGER BOT - FINAL")
@@ -47,6 +53,47 @@ def send_photo(chat_id, photo_url, caption, reply_markup=None):
     except:
         # Fallback to send message if photo fails
         send_message(chat_id, caption, reply_markup)
+
+def is_sudo_user(user_id):
+    """Check if user is sudo user and not expired"""
+    if user_id == OWNER_ID:
+        return True  # Owner is always sudo
+    
+    if user_id in sudo_users:
+        expiry = sudo_users[user_id]["expiry"]
+        if datetime.now() < expiry:
+            return True
+        else:
+            # Remove expired sudo user
+            del sudo_users[user_id]
+    return False
+
+def parse_time_duration(duration_str):
+    """Parse time duration like '10 min', '1 hour', '2 days', '1 year'"""
+    duration_str = duration_str.lower().strip()
+    
+    # Handle numbers and words
+    match = re.match(r'(\d+)\s*(min|minute|hour|day|week|month|year)s?', duration_str)
+    if not match:
+        return None
+    
+    value = int(match.group(1))
+    unit = match.group(2)
+    
+    if unit in ['min', 'minute']:
+        return timedelta(minutes=value)
+    elif unit == 'hour':
+        return timedelta(hours=value)
+    elif unit == 'day':
+        return timedelta(days=value)
+    elif unit == 'week':
+        return timedelta(weeks=value)
+    elif unit == 'month':
+        return timedelta(days=value * 30)
+    elif unit == 'year':
+        return timedelta(days=value * 365)
+    
+    return None
 
 async def test_session(session_string):
     try:
@@ -172,6 +219,22 @@ def show_all_sessions(chat_id):
         text += f"   📊 Status: {status}\n\n"
     send_message(chat_id, text)
 
+def show_sudo_users(chat_id):
+    if not sudo_users:
+        send_message(chat_id, "❌ No sudo users found!")
+        return
+    
+    text = "**👑 Sudo Users List:**\n\n"
+    for user_id, data in sudo_users.items():
+        expiry = data["expiry"].strftime("%Y-%m-%d %H:%M:%S")
+        username = data.get("username", "Unknown")
+        approved_by = data.get("approved_by", "System")
+        text += f"**User:** `{user_id}`\n"
+        text += f"**Username:** @{username}\n"
+        text += f"**Expiry:** {expiry}\n"
+        text += f"**Approved by:** `{approved_by}`\n\n"
+    send_message(chat_id, text)
+
 async def main():
     global last_update_id, current_group
     while True:
@@ -194,8 +257,9 @@ async def main():
                     data_cb = callback["data"]
                     print(f"\n📞 Callback: {data_cb}")
                     
-                    if user_id != OWNER_ID:
-                        send_message(chat_id, "❌ Access Denied! Only bot owner can use this bot.")
+                    # Callback query access check
+                    if user_id != OWNER_ID and not is_sudo_user(user_id):
+                        send_message(chat_id, "❌ Access Denied! Only sudo users can use this bot.\nContact owner for approval.")
                         requests.post(f"{API_URL}/answerCallbackQuery", json={"callback_query_id": callback["id"]})
                         continue
                     
@@ -208,7 +272,8 @@ async def main():
                         status_text += f"📱 Sessions: {len(user_sessions)}\n"
                         status_text += f"🔌 Connected: {len(user_clients)}\n"
                         status_text += f"🎤 Active VC: {len(active_vc)}\n"
-                        status_text += f"📋 Groups: {len(groups_list)}\n\n"
+                        status_text += f"📋 Groups: {len(groups_list)}\n"
+                        status_text += f"👑 Sudo Users: {len(sudo_users)}\n\n"
                         if user_sessions:
                             status_text += "**Sessions:**\n"
                             for s in user_sessions:
@@ -268,6 +333,9 @@ async def main():
                         if user_id in leave_selected_group:
                             del leave_selected_group[user_id]
                     
+                    elif data_cb == "show_sudo":
+                        show_sudo_users(chat_id)
+                    
                     requests.post(f"{API_URL}/answerCallbackQuery", json={"callback_query_id": callback["id"]})
                 
                 elif "message" in update:
@@ -275,9 +343,107 @@ async def main():
                     user_id = msg["from"]["id"]
                     chat_id = msg["chat"]["id"]
                     text = msg.get("text", "")
-                    print(f"\n📨 Message: {text}")
+                    username = msg["from"].get("username", "NoUsername")
+                    print(f"\n📨 Message from {username} ({user_id}): {text}")
                     
-                    if user_id != OWNER_ID:
+                    # Handle approval requests from non-sudo users
+                    if user_id != OWNER_ID and not is_sudo_user(user_id):
+                        if text == "/start":
+                            # Check if already requested
+                            if user_id in pending_approvals:
+                                send_message(chat_id, f"⏳ Your request is already pending! Owner will approve you soon.\n\nUser ID: `{user_id}`\nUsername: @{username}")
+                            else:
+                                # Store pending approval
+                                pending_approvals[user_id] = {
+                                    "request_time": datetime.now(),
+                                    "username": username,
+                                    "chat_id": chat_id
+                                }
+                                # Notify owner
+                                owner_msg = f"**🆕 New Sudo Request!**\n\n"
+                                owner_msg += f"**User ID:** `{user_id}`\n"
+                                owner_msg += f"**Username:** @{username}\n"
+                                owner_msg += f"**Chat ID:** `{chat_id}`\n\n"
+                                owner_msg += f"Use: `/approve {user_id} 10 min` to approve\n"
+                                owner_msg += f"Examples:\n"
+                                owner_msg += f"`/approve {user_id} 10 min`\n"
+                                owner_msg += f"`/approve {user_id} 1 hour`\n"
+                                owner_msg += f"`/approve {user_id} 2 days`\n"
+                                owner_msg += f"`/approve {user_id} 1 year`"
+                                
+                                send_message(OWNER_ID, owner_msg)
+                                
+                                # Send message to user
+                                send_message(chat_id, f"❌ **Access Denied!**\n\nYou are not authorized to use this bot.\n\n📢 **Request sent to owner!**\n🆔 Your ID: `{user_id}`\n👤 Username: @{username}\n\n⏳ Please wait for owner approval.\n\n_You will be notified when approved._")
+                        else:
+                            send_message(chat_id, f"❌ Access Denied! You are not a sudo user.\n\nUse /start to request access from owner.\n\nYour ID: `{user_id}`")
+                        continue
+                    
+                    # Owner commands for sudo management
+                    if user_id == OWNER_ID and text.startswith("/approve"):
+                        parts = text.split()
+                        if len(parts) >= 3:
+                            try:
+                                target_user_id = int(parts[1])
+                                duration_str = ' '.join(parts[2:])
+                                
+                                duration = parse_time_duration(duration_str)
+                                if duration:
+                                    expiry_time = datetime.now() + duration
+                                    
+                                    # Get username
+                                    target_username = "Unknown"
+                                    try:
+                                        resp = requests.get(f"{API_URL}/getChat", params={"chat_id": target_user_id}, timeout=5)
+                                        if resp.ok:
+                                            target_username = resp.json()["result"].get("username", "Unknown")
+                                    except:
+                                        pass
+                                    
+                                    sudo_users[target_user_id] = {
+                                        "expiry": expiry_time,
+                                        "username": target_username,
+                                        "approved_by": OWNER_ID
+                                    }
+                                    
+                                    # Remove from pending if exists
+                                    if target_user_id in pending_approvals:
+                                        user_chat_id = pending_approvals[target_user_id].get("chat_id")
+                                        if user_chat_id:
+                                            send_message(user_chat_id, f"✅ **Access Granted!**\n\nYou have been approved as sudo user!\n⏰ Duration: {duration_str}\n📅 Expires: {expiry_time.strftime('%Y-%m-%d %H:%M:%S')}\n\nUse /start to access the bot.")
+                                        del pending_approvals[target_user_id]
+                                    
+                                    send_message(chat_id, f"✅ User `{target_user_id}` approved as sudo user for {duration_str}!")
+                                    send_message(chat_id, f"📅 Expires on: {expiry_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                                else:
+                                    send_message(chat_id, "❌ Invalid duration! Use format: `/approve user_id 10 min`\nExamples: `10 min`, `1 hour`, `2 days`, `1 year`")
+                            except ValueError:
+                                send_message(chat_id, "❌ Invalid user ID! Use numeric ID only.")
+                        else:
+                            send_message(chat_id, "❌ Usage: `/approve user_id duration`\n\nExamples:\n`/approve 123456789 10 min`\n`/approve 123456789 1 hour`\n`/approve 123456789 2 days`\n`/approve 123456789 1 year`")
+                        
+                        continue
+                    
+                    # Remove sudo user
+                    if user_id == OWNER_ID and text.startswith("/removesudo"):
+                        parts = text.split()
+                        if len(parts) == 2:
+                            try:
+                                target_user_id = int(parts[1])
+                                if target_user_id in sudo_users:
+                                    del sudo_users[target_user_id]
+                                    send_message(chat_id, f"✅ Removed sudo access for user `{target_user_id}`")
+                                else:
+                                    send_message(chat_id, f"❌ User `{target_user_id}` is not a sudo user")
+                            except ValueError:
+                                send_message(chat_id, "❌ Invalid user ID!")
+                        else:
+                            send_message(chat_id, "❌ Usage: `/removesudo user_id`")
+                        continue
+                    
+                    # List sudo users
+                    if user_id == OWNER_ID and text == "/listsudo":
+                        show_sudo_users(chat_id)
                         continue
                     
                     # Handle leave count input
@@ -302,7 +468,7 @@ async def main():
                             send_message(chat_id, "❌ Please send a valid number!")
                         continue
                     
-                    # Regular commands
+                    # Regular commands for sudo users
                     if text == "/start":
                         # Caption for the image
                         caption = """**🎵 VC Manager Bot** 
@@ -316,7 +482,12 @@ Welcome to VC Manager Bot! I can help you manage multiple accounts in voice chat
 /groups - All groups
 /sessions - All sessions
 /status - Status
-/done - Done"""
+/done - Done
+
+**Sudo Commands (Owner only):**
+/approve <user_id> <duration> - Approve user
+/removesudo <user_id> - Remove sudo user
+/listsudo - List all sudo users"""
                         
                         # Keyboard with 2 buttons per row
                         kb = {"inline_keyboard": [
@@ -324,6 +495,10 @@ Welcome to VC Manager Bot! I can help you manage multiple accounts in voice chat
                             [{"text": "📱 My Sessions", "callback_data": "show_sessions"}, {"text": "➕ Add Group", "callback_data": "public_group"}],
                             [{"text": "📋 Groups", "callback_data": "show_groups"}, {"text": "🚪 Leave VC", "callback_data": "leave_vc"}]
                         ]}
+                        
+                        # Add sudo button for owner
+                        if user_id == OWNER_ID:
+                            kb["inline_keyboard"].append([{"text": "👑 Manage Sudo Users", "callback_data": "show_sudo"}])
                         
                         # Send image with caption and buttons
                         send_photo(chat_id, IMAGE_URL, caption, kb)
@@ -388,6 +563,7 @@ Welcome to VC Manager Bot! I can help you manage multiple accounts in voice chat
                         status_text += f"🔌 Connected: {len(user_clients)}\n"
                         status_text += f"🎤 Active VC: {len(active_vc)}\n"
                         status_text += f"📋 Groups: {len(groups_list)}\n"
+                        status_text += f"👑 Sudo Users: {len(sudo_users)}\n"
                         if current_group:
                             status_text += f"\n📍 Current: {current_group['name']}"
                         send_message(chat_id, status_text)
