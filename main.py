@@ -11,6 +11,9 @@ from config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID
 TOKEN = BOT_TOKEN
 API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
+# Get image URL from environment variable
+IMAGE_URL = os.environ.get("IMAGE_URL", "https://telegra.ph/file/default-image.jpg")
+
 # Data storage
 user_sessions = []
 user_clients = {}
@@ -34,6 +37,16 @@ def send_message(chat_id, text, reply_markup=None):
         requests.post(f"{API_URL}/sendMessage", json=data, timeout=5)
     except:
         pass
+
+def send_photo(chat_id, photo_url, caption, reply_markup=None):
+    data = {"chat_id": chat_id, "photo": photo_url, "caption": caption, "parse_mode": "Markdown"}
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup)
+    try:
+        requests.post(f"{API_URL}/sendPhoto", json=data, timeout=5)
+    except:
+        # Fallback to send message if photo fails
+        send_message(chat_id, caption, reply_markup)
 
 async def test_session(session_string):
     try:
@@ -291,20 +304,33 @@ async def main():
                     
                     # Regular commands
                     if text == "/start":
+                        # Caption for the image
+                        caption = """**🎵 VC Manager Bot** 
+
+Welcome to VC Manager Bot! I can help you manage multiple accounts in voice chats.
+
+**Commands:**
+/add - Add group
+/joinvc <count> - Join VC
+/leavevc - Smart leave
+/groups - All groups
+/sessions - All sessions
+/status - Status
+/done - Done"""
+                        
+                        # Keyboard with 2 buttons per row
                         kb = {"inline_keyboard": [
-                            [{"text": "🔌 Connect Session", "callback_data": "connect"}],
-                            [{"text": "📊 Status", "callback_data": "status"}],
-                            [{"text": "📱 My Sessions", "callback_data": "show_sessions"}],
-                            [{"text": "➕ Add Group", "callback_data": "public_group"}],
-                            [{"text": "📋 Groups", "callback_data": "show_groups"}],
-                            [{"text": "🚪 Leave VC", "callback_data": "leave_vc"}]
+                            [{"text": "🔌 Connect Session", "callback_data": "connect"}, {"text": "📊 Status", "callback_data": "status"}],
+                            [{"text": "📱 My Sessions", "callback_data": "show_sessions"}, {"text": "➕ Add Group", "callback_data": "public_group"}],
+                            [{"text": "📋 Groups", "callback_data": "show_groups"}, {"text": "🚪 Leave VC", "callback_data": "leave_vc"}]
                         ]}
-                        send_message(chat_id, "**🎵 VC Manager Bot**\n\n**Commands:**\n/add - Add group\n/joinvc <count> - Join VC\n/leavevc - Smart leave\n/groups - All groups\n/sessions - All sessions\n/status - Status\n/done - Done", kb)
+                        
+                        # Send image with caption and buttons
+                        send_photo(chat_id, IMAGE_URL, caption, kb)
                     
                     elif text == "/add":
                         kb = {"inline_keyboard": [
-                            [{"text": "🌐 Public", "callback_data": "public_group"}],
-                            [{"text": "🔒 Private", "callback_data": "private_group"}]
+                            [{"text": "🌐 Public", "callback_data": "public_group"}, {"text": "🔒 Private", "callback_data": "private_group"}]
                         ]}
                         send_message(chat_id, "Select type:", kb)
                     
